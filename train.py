@@ -225,6 +225,13 @@ def train(cfg, data_dir, device):
                         'best_val_loss': best_val, 'cfg': cfg,
                     }, os.path.join(cfg.save_dir, 'best.pt'))
                     print(f'  New best!')
+                torch.save({
+                    'step': step, 'model': model.state_dict(),
+                    'best_val_loss': best_val, 'cfg': cfg,
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                }, os.path.join(cfg.save_dir, f'eval_{step}.pt'))
+                print(f'  Saved eval_{step}.pt')
 
             if step > 0 and step % cfg.save_interval == 0:
                 ckpt = {
@@ -238,13 +245,15 @@ def train(cfg, data_dir, device):
                 del ckpt; gc.collect()
 
     except KeyboardInterrupt:
-        torch.save({
+        ckpt = {
             'step': step, 'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
             'best_val_loss': best_val, 'cfg': cfg,
-        }, os.path.join(cfg.save_dir, f'interrupt_step_{step}.pt'))
-        print(f'\nInterrupted. Saved step_{step}.pt')
+        }
+        path = os.path.join(cfg.save_dir, f'step_{step}.pt')
+        torch.save(ckpt, path)
+        print(f'\nInterrupted. Saved {path}')
 
     print('Done.')
 
@@ -267,6 +276,7 @@ if __name__ == '__main__':
     parser.add_argument('--save-interval', type=int, default=2000, help='Save every N steps')
     parser.add_argument('--no-lambda', action='store_true', help='Disable lambda_d hierarchy')
     parser.add_argument('--accum', type=int, default=1, help='Gradient accumulation steps')
+    parser.add_argument('--bind-twist-mode', default='shift', help='BottleneckBind twist mode (off/shift/cascade)')
     parser.add_argument('--device', default='cuda', help='Device (cuda/cpu)')
     args = parser.parse_args()
 
@@ -282,6 +292,7 @@ if __name__ == '__main__':
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
         lambda_d_enabled=not args.no_lambda,
+        bind_twist_mode=args.bind_twist_mode,
         data_dir=args.data_dir,
         save_dir=args.save_dir,
         grad_clip=0.5,

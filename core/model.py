@@ -579,6 +579,169 @@ class GroupedCognitiveMirror(nn.Module):
             self._prev_grad_norm.copy_(self._hp_grad)
 
 
+def migrate_bind_state_dict(sd, n_layers, mode="off", S=1):
+    """Convert old (pre-BottleneckBind) state dict keys to new format.
+    Old: layers.N.W_proj (D,K)  layers.N.W_out (K,D)  layers.N.w_u (K,)  layers.N.w_v (K,)
+    New: layers.N.bind.W_proj.weight (K,D)  layers.N.bind.W_out (K,D|S,K,D)  layers.N.bind.w_u (S,K)  layers.N.bind.w_v (S,K)
+    """
+    import re
+    map_sd = {}
+    for key, val in sd.items():
+        m = re.match(r'layers\.(\d+)\.(W_proj|W_out|w_u|w_v|w_bind_bias)$', key)
+        if not m:
+            map_sd[key] = val
+            continue
+        lidx, param = m.groups()
+        new_key = f'layers.{lidx}.bind.{param}'
+        if param == 'W_proj':
+            new_key = f'layers.{lidx}.bind.{param}.weight'
+            map_sd[new_key] = val.t().contiguous()
+        elif param == 'w_u' or param == 'w_v':
+            map_sd[new_key] = val.unsqueeze(0)
+        else:
+            map_sd[new_key] = val
+    return map_sd
+
+
+def _golden_shifts(K: int, S: int) -> list:
+    phi = (1.0 + 5.0 ** 0.5) / 2.0
+    shifts, used = [], set()
+    s = 1
+    while len(shifts) < S:
+        sh = int(math.floor(s * K / phi)) % K
+        while sh in used or sh == 0:
+            sh = (sh + 1) % K
+        shifts.append(sh); used.add(sh); s += 1
+    return shifts
+
+
+class BottleneckBind(nn.Module):
+    def __init__(self, D: int, K: int, cfg):
+        super().__init__()
+        self.D, self.K = D, K
+        self.mode = getattr(cfg, "bind_twist_mode", "off")
+        self.S = 1 if self.mode == "off" else int(getattr(cfg, "bind_twist_S", 4))
+        self.ocular = getattr(cfg, "bind_twist_ocular", "tied")
+        self.gated = bool(getattr(cfg, "bind_twist_gate", False)) and self.mode != "off"
+        scheme = getattr(cfg, "bind_twist_scheme", "golden")
+        tie_bind = bool(getattr(cfg, "tie_bind", True))
+
+        self.w_bind_bias = nn.Parameter(torch.zeros(K))
+
+        self.W_proj = nn.Linear(D, K, bias=False)
+
+        shifts = _golden_shifts(K, self.S) if scheme == "golden" else _fibonacci_shifts(K, self.S)
+        self.register_buffer("shifts", torch.tensor(shifts, dtype=torch.long), persistent=False)
+
+        self.w_u = nn.Parameter(torch.empty(self.S, K))
+        self.w_v = nn.Parameter(torch.empty(self.S, K))
+        nn.init.normal_(self.w_u, 0.0, 1.0)
+        nn.init.normal_(self.w_v, 0.0, 1.0)
+
+        if self.mode != "off" and self.ocular == "multi" and self.S > 1:
+            self.W_out = nn.Parameter(torch.empty(self.S, K, D))
+            nn.init.normal_(self.W_out, 0.0, 0.02)
+            self._tied = False
+        else:
+            self.W_out = nn.Parameter(torch.empty(K, D))
+            nn.init.normal_(self.W_out, 0.0, 0.02)
+            self._tied = tie_bind
+            if self._tied:
+                self.W_proj.register_forward_pre_hook(self._tie_hook)
+
+        if self.gated:
+            self.w_gate_proj = nn.Linear(K, self.S, bias=True)
+            nn.init.normal_(self.w_gate_proj.weight, 0.0, 0.02)
+            nn.init.zeros_(self.w_gate_proj.bias)
+
+        if self.mode == "cascade":
+            self.mix_logit = nn.Parameter(torch.zeros(self.S))
+
+    def _tie_hook(self, module, inp):
+        with torch.no_grad():
+            self.W_out.data.copy_(self.W_proj.weight.data)
+
+    def _cross(self, left, right, shift):
+        return left * torch.roll(right, shifts=int(shift), dims=-1)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        hp = self.W_proj(h) + self.w_bind_bias
+
+        if self.gated:
+            g = torch.sigmoid(self.w_gate_proj(hp)).unsqueeze(-1)
+        else:
+            g = None
+
+        if self.mode == "off":
+            prod = (hp * self.w_u[0]) * (hp * self.w_v[0])
+            return prod @ self.W_out
+
+        if self.mode == "shift":
+            if not self._tied and self.ocular == "multi":
+                out = None
+                for s in range(self.S):
+                    prod = self._cross(hp * self.w_u[s], hp * self.w_v[s], self.shifts[s])
+                    if g is not None:
+                        prod = prod * g[:, :, s]
+                    term = prod @ self.W_out[s]
+                    out = term if out is None else out + term
+                return out
+            else:
+                acc = None
+                for s in range(self.S):
+                    prod = self._cross(hp * self.w_u[s], hp * self.w_v[s], self.shifts[s])
+                    if g is not None:
+                        prod = prod * g[:, :, s]
+                    acc = prod if acc is None else acc + prod
+                return acc @ self.W_out
+
+        if self.mode == "cascade":
+            a = [None] * (self.S + 1)
+            a[1] = hp * self.w_u[0]
+            a[2] = hp * self.w_v[0] if self.S >= 2 else a[1]
+            seed_norm = a[1].norm(dim=-1, keepdim=True).detach()
+            for n in range(3, self.S + 1):
+                crossed = self._cross(a[n-1] * self.w_u[n-1], a[n-2] * self.w_v[n-1], self.shifts[n-1])
+                a[n] = F.normalize(crossed, dim=-1) * seed_norm
+
+            mix = torch.softmax(self.mix_logit, dim=0)
+            if not self._tied and self.ocular == "multi":
+                out = None
+                for n in range(1, self.S + 1):
+                    w = mix[n-1]
+                    if g is not None:
+                        w = w * g[:, :, n-1]
+                    term = a[n] * w.unsqueeze(-1) @ self.W_out[n-1]
+                    out = term if out is None else out + term
+                return out
+            else:
+                m = None
+                for n in range(1, self.S + 1):
+                    w = mix[n-1]
+                    if g is not None:
+                        w = w * g[:, :, n-1]
+                    term = a[n] * w.unsqueeze(-1)
+                    m = term if m is None else m + term
+                return m @ self.W_out
+
+
+def _fibonacci_shifts(K: int, S: int) -> list:
+    shifts, used, a, b = [], set(), 1, 1
+    guard = 0
+    while len(shifts) < S and guard < 10 * S:
+        sh = b % K
+        if sh not in used and sh != 0:
+            shifts.append(sh); used.add(sh)
+        a, b = b, a + b; guard += 1
+    if len(shifts) < S:
+        for g in _golden_shifts(K, S):
+            if g not in used:
+                shifts.append(g); used.add(g)
+            if len(shifts) == S:
+                break
+    return shifts
+
+
 # ─── Grouped MLP ──────────────────────────────────────────────────────
 
 class GroupedMLP(nn.Module):
@@ -646,21 +809,8 @@ class WideBindBlock(nn.Module):
         self.register_buffer('pre_ln_w', torch.ones(cfg.D))
         self.total_layers = cfg.n_layers
         
-        # ─── Bind: D -> K -> bilinear -> D ───
-        proj_std = 1.0 / (cfg.D * cfg.bind_K) ** 0.25
-        self.W_proj = nn.Parameter(torch.randn(cfg.D, cfg.bind_K) * proj_std)
-        self.w_bind_bias = nn.Parameter(torch.zeros(cfg.bind_K))
-        self.w_u = nn.Parameter(torch.randn(cfg.bind_K))
-        self.w_v = nn.Parameter(torch.randn(cfg.bind_K))
-        if cfg.tie_bind:
-            self.register_buffer('W_out', torch.zeros(cfg.bind_K, cfg.D))
-            with torch.no_grad():
-                self.W_out.copy_(self.W_proj.T)
-            # sync before each forward
-            self._hook = self.register_forward_pre_hook(
-                lambda mod, args: mod._sync_W_out())
-        else:
-            self.W_out = nn.Parameter(torch.randn(cfg.bind_K, cfg.D) * proj_std)
+        # ─── Bind: D -> K -> BottleneckBind (twisted bilinear) ───
+        self.bind = BottleneckBind(cfg.D, cfg.bind_K, cfg)
 
         # Cognitive Mirror (32 эксперта, grouped K-space)
         if getattr(cfg, 'mirror_k_staircase', False):
@@ -729,10 +879,6 @@ class WideBindBlock(nn.Module):
         # ─── MLP (grouped: per-group 4× expansion, half params) ───
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups)
     
-    def _sync_W_out(self):
-        with torch.no_grad():
-            self.W_out.copy_(self.W_proj.T)
-    
     def forward(self, h, state=None, global_state=None,
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,
                 tanh_bias_mod=1.0, pred_scale_mod=None, spectral_mod=1.0):
@@ -758,11 +904,8 @@ class WideBindBlock(nn.Module):
         h = h + h_conv
         self._cache_conv_out = h_conv.detach()
         
-        # ─── Hybrid Bind: D -> K -> bilinear -> D ───
-        hp = h @ self.W_proj + self.w_bind_bias  # (B, L, K) with learnable offset
-        u = hp * self.w_u             # (B, L, K)
-        v = hp * self.w_v             # (B, L, K)
-        bind_out = (u * v) @ self.W_out  # (B, L, D)
+        # ─── Bind: BottleneckBind ───
+        bind_out = self.bind(h)
         
         # ─── VSA Memory (multi-scale: S=4 фиксированных τ) ───
         S = self._n_scales
