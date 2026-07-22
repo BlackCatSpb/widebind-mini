@@ -89,6 +89,13 @@ def train(cfg, data_dir, device):
     model = WideBindStack(cfg).to(device)
     n = model.param_count()
     print(f'Model: {n:,} params ({n/1e6:.2f}M)')
+    # torch.compile — ~30% tok/s на CUDA, fallback при ошибке
+    if device == 'cuda':
+        try:
+            model = torch.compile(model, mode='reduce-overhead')
+            print('  torch.compile: ON')
+        except Exception:
+            print('  torch.compile: SKIP (fallback to eager)')
     if device == 'cuda':
         print(f'  VRAM used: {torch.cuda.memory_allocated()/1e9:.2f} GB')
 
