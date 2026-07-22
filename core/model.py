@@ -268,7 +268,7 @@ class GroupedCognitiveMirror(nn.Module):
     """
     def __init__(self, D, G=32, k=32, w_pred_scale_init=3.0, log_scale_init_std=0.05,
                  delta_var_ema_min=0.8, delta_var_ema_max=0.99, tie_mirror_proj=False,
-                 layer_idx=0, n_layers=32):
+                 layer_idx=0, n_layers=32, has_private_mem=False):
         super().__init__()
         assert D % G == 0
         self.D = D
@@ -322,7 +322,8 @@ class GroupedCognitiveMirror(nn.Module):
         self.w_pred_scale_legacy = nn.Parameter(torch.ones(G, k) * w_pred_scale_init)
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         # EMA norms for signal normalization (Proposal V-1)
-        self.register_buffer('_signal_norm_ema', torch.ones(4, G, k) * 3.0, persistent=False)
+        n_signals = 5 if has_private_mem else 4
+        self.register_buffer('_signal_norm_ema', torch.ones(n_signals, G, k) * 3.0, persistent=False)
         # Asymmetric init: guaranties non-zero var(log_scale) from step 0.
         # Without it, diversity loss has zero gradient at init (cold start).
         ls_base = torch.linspace(-0.2, 0.2, G).unsqueeze(1).expand(G, self.d)
@@ -338,6 +339,17 @@ class GroupedCognitiveMirror(nn.Module):
         
         # External gradient cache (устанавливается hook'ом после backward)
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
+        # Private memory bank: expert confident K-space states (cross-expert recall)
+        self._has_private_mem = has_private_mem
+        if has_private_mem:
+            self.register_buffer('_private_mem', torch.zeros(G, self.k))
+            # w_help init = log(3.0) -> sigmoid ~0.75: strong initial presence, prevents cold-start suppression
+            self.w_help = nn.Parameter(torch.full((G, 1), math.log(3.0)))  # per-expert scale for recalled help
+            self.w_contra = nn.Parameter(torch.full((G,), 0.01))  # small positive: disagreement opens gate by default
+            # Expert knowledge graph: concept similarity, behavior divergence, trust
+            self.register_buffer('_concept_sim_ema', torch.eye(G), persistent=False)   # (G, G) — who shares concepts
+            self.register_buffer('_behavior_div_ema', torch.zeros(G, G), persistent=False)  # (G, G) — who behaves differently
+            self.register_buffer('_trust_matrix', torch.eye(G) * 0.5, persistent=False)     # (G, G) — who helps whom
         self.register_buffer('_hp_grad', torch.zeros(G), persistent=False)
         self.register_buffer('_delta_var', torch.zeros(G), persistent=False)  # running EMA of delta var
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
@@ -350,6 +362,13 @@ class GroupedCognitiveMirror(nn.Module):
         self._cached_pred_k = None
         self._cached_hp = None
         self._cached_pred_error_norm = None
+        self._cached_contra = None
+        self._cached_disagreement = None
+        self._cached_contra_graph = None
+        self._cached_contra_expert = None
+        self._cached_concept_dendrogram = None
+        self._cached_dominance = None
+        self._cached_isolation = None
         # Residual variance EMA for adaptive tau (self-organizing timescales)
         self.register_buffer('_residual_var_ema', torch.ones(G, k) * 0.1, persistent=False)
         
@@ -369,7 +388,7 @@ class GroupedCognitiveMirror(nn.Module):
         self._delta_var_ema_max = delta_var_ema_max
 
         # ─── Learnable signal weights (softmax-normalized) ───
-        self._signal_log_weights = nn.Parameter(torch.zeros(4))
+        self._signal_log_weights = nn.Parameter(torch.zeros(n_signals))
         
         # ─── Self-organizing usefulness predictor (competitive) ───
         # Каждый эксперт предсказывает свою полезность по delta (K-space correction)
@@ -470,6 +489,77 @@ class GroupedCognitiveMirror(nn.Module):
         pred_error_norm = (raw_pred_error / hp_norm).norm(dim=(-2, -1))  # (B, L)
         self._cached_pred_error_norm = pred_error_norm
         
+        # ─── Private Memory: read via cross-expert attention (when uncertain) ───
+        if self._has_private_mem:
+            uncert = torch.sigmoid(pred_error.abs())  # (B, L, G, k)
+            q = hp * uncert
+            keys = self._private_mem.detach().clone()  # (G, k) — frozen snapshot for autograd
+            attn = F.softmax(q @ keys.T / math.sqrt(self.k), dim=-1)  # (B, L, G, G)
+            help_k_base = attn @ keys  # (B, L, G, k) — collective confident memory
+            # ─── Contradiction gate: disagreement between expert hp and collective help_k ───
+            hp_n = hp.norm(dim=-1).clamp(min=1e-8)  # (B, L, G)
+            disagreement = (hp - help_k_base).norm(dim=-1) / hp_n  # relative: 0=agrees, >>1=contradicts
+            contra = torch.sigmoid(disagreement - 1.0)  # sigmoid(rel_disagree - 1): <1=agrees, >1=contradicts
+            trust = 1.0 - contra  # how much to trust help_k (low when contradictory)
+            # Apply contradiction-aware scaling: 
+            # high disagreement + confident expert → expert is confidently wrong → reduce help_k
+            # high disagreement + uncertain expert → collective irrelevant → reduce help_k
+            help_k = help_k_base * torch.sigmoid(self.w_help).unsqueeze(0).unsqueeze(0)
+            help_k = help_k * trust.unsqueeze(-1)  # trust-weighted collective memory
+            self._cached_contra = contra.detach()  # for analysis
+            self._cached_disagreement = disagreement.detach()  # for analysis
+        else:
+            help_k = torch.zeros_like(hp)
+            trust = torch.ones_like(hp.norm(dim=-1))  # no contradiction when disabled
+        
+        # ─── Expert Knowledge Graph update (uses OLD private_mem, runs before write) ───
+        if self._has_private_mem and self.training:
+            with torch.no_grad():
+                pm = self._private_mem
+                pm_norm = pm.norm(dim=-1, keepdim=True).clamp(min=1e-10)
+                pm_n = pm / pm_norm  # safe normalize (no NaN on zero vectors)
+                concept_sim = pm_n @ pm_n.T
+                self._concept_sim_ema.mul_(0.999).add_(concept_sim, alpha=0.001)
+                hp_avg = hp.mean(dim=(0, 1))
+                hp_n = F.normalize(hp_avg, dim=-1)
+                behavior_sim = hp_n @ hp_n.T
+                behavior_div = 1.0 - behavior_sim
+                self._behavior_div_ema.mul_(0.999).add_(behavior_div, alpha=0.001)
+                trust_weights = attn.mean(dim=(0, 1))
+                self._trust_matrix.mul_(0.999).add_(trust_weights, alpha=0.001)
+                contra_g = concept_sim * behavior_div
+                self._cached_contra_graph = contra_g
+                contra_expert = contra_g.mean(dim=-1)
+                self._cached_contra_expert = contra_expert
+                sim_vals = concept_sim[~torch.eye(self.G, dtype=torch.bool, device=concept_sim.device)]
+                q_hi = sim_vals.quantile(0.75)
+                q_lo = sim_vals.quantile(0.25)
+                self._cached_concept_dendrogram = (q_hi.item(), q_lo.item())
+                dominance = self._trust_matrix.sum(dim=0)
+                isolation = 1.0 - (self._trust_matrix.sum(dim=-1) / self.G)
+                self._cached_dominance = dominance
+                self._cached_isolation = isolation
+        
+        # ─── Private Memory: write confident K-space states (contradiction-aware) ───
+        if self._has_private_mem and self.training:
+            with torch.no_grad():
+                conf = torch.sigmoid(-pred_error.abs().mean(dim=-1, keepdim=True))
+                contra_u = contra.unsqueeze(-1)
+                contra_expert_coll = self._cached_contra_expert.to(conf.device).view(1, 1, G, 1)
+                isolation_coll = self._cached_isolation.to(conf.device).view(1, 1, G, 1)
+                social_pressure = 1.0 - 0.5 * torch.sigmoid(contra_expert_coll.clamp(min=0) + isolation_coll)
+                conf_plastic = conf * (1.0 - contra_u) * social_pressure
+                # Soft competition: temperature prevents winner-take-all monoculture
+                temp_write = 2.0  # >1 softens competition, <1 sharpens
+                conf_soft = conf_plastic ** temp_write
+                conf_bc = conf_soft * self.G / (conf_soft.sum(dim=-2, keepdim=True) + 1e-8)
+                weighted_hp = (conf_bc * hp.detach()).mean(dim=(0, 1))
+                # Adaptive decay: fast warmup when memory is nascent, slow when stable
+                pm_scale = self._private_mem.norm(dim=-1).mean().clamp(min=1e-8)
+                warmup_rate = torch.sigmoid(3.0 - pm_scale)  # ~1.0 when pm~0, ~0.0 when pm>3
+                pm_decay = 0.999 - 0.009 * warmup_rate  # [0.990, 0.999] — faster decay when memory is empty
+                self._private_mem.mul_(pm_decay).add_(weighted_hp, alpha=1.0 - pm_decay)
+        
         # ─── Fast signals (hi half of K-space) ───
         # Smoothness: local coherence in K-space (CAUSAL: pad left only)
         hp_perm = hp.permute(0, 2, 3, 1).reshape(B, G * k, L)  # (B, G*k, L)
@@ -482,7 +572,10 @@ class GroupedCognitiveMirror(nn.Module):
         sym_k = (hp * self.w_sym_u) * (hp_prev * self.w_sym_v)
         
         # ─── EMA-нормировка сигналов (соизмеримость перед softmax) ───
-        signals = [temp_k, pred_error, smooth_k, sym_k]
+        if self._has_private_mem:
+            signals = [temp_k, pred_error, smooth_k, sym_k, help_k]
+        else:
+            signals = [temp_k, pred_error, smooth_k, sym_k]
         signals_normed = []
         decay = 0.001  # ~1000-step EMA
         for i, s in enumerate(signals):
@@ -493,11 +586,11 @@ class GroupedCognitiveMirror(nn.Module):
             signals_normed.append(s_norm)
         
         # ─── Learnable signal weights (softmax-normalized) ───
-        w = torch.softmax(self._signal_log_weights, dim=0)  # 4 weights summing to 1
+        n_sig = len(signals)
+        w = torch.softmax(self._signal_log_weights, dim=0)  # {n_sig} weights summing to 1
         
         # ─── Merge all signals (weighted sum) ───
-        delta = (w[0] * signals_normed[0] + w[1] * signals_normed[1] + 
-                 w[2] * signals_normed[2] + w[3] * signals_normed[3])
+        delta = sum(w[i] * signals_normed[i] for i in range(n_sig))
         
         delta = F.rms_norm(delta, (delta.shape[-1],))  # norm over k
         delta = delta + self.tanh_bias * tanh_bias_mod
@@ -552,6 +645,13 @@ class GroupedCognitiveMirror(nn.Module):
         gate_logits = gate_logits + delta_gate
         gate_logits = gate_logits + grad_mod.unsqueeze(0).unsqueeze(0)
         gate_logits = gate_logits + dvar_mod.unsqueeze(0).unsqueeze(0)
+        # Contradiction signal: expert vs collective disagreement opens gate (arbiter)
+        if self._has_private_mem:
+            gate_logits = gate_logits + disagreement * self.w_contra.unsqueeze(0).unsqueeze(0)
+            # Concept graph pressure: high contradiction → open gate more
+            if self._cached_contra_expert is not None:
+                ce = self._cached_contra_expert.to(gate_logits.device).unsqueeze(0).unsqueeze(0)
+                gate_logits = gate_logits + ce  # collective contradiction raises gate
         
         expert_gate = torch.sigmoid(gate_logits)  # (B, L, G)
         # Cache gate L1 for auxiliary sparsity loss (still in graph for gradients)
@@ -832,7 +932,8 @@ class WideBindBlock(nn.Module):
             w_pred_scale_init=cfg.w_pred_scale_init, log_scale_init_std=cfg.log_scale_init_std,
             delta_var_ema_min=cfg.delta_var_ema_min, delta_var_ema_max=cfg.delta_var_ema_max,
             tie_mirror_proj=cfg.tie_mirror_proj,
-            layer_idx=layer_idx, n_layers=cfg.n_layers)
+            layer_idx=layer_idx, n_layers=cfg.n_layers,
+            has_private_mem=cfg.private_mem)
         
         # ─── VSA Memory (multi-scale VSA: S=4 фиксированных τ) ───
         self._n_scales = 4
