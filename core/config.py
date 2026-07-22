@@ -92,6 +92,7 @@ class WideBandConfig:
     bind_twist_gate: bool = False        # per-token adaptive aperture via hp
 
     accum_steps: int = 1
+    compile: bool = False
 
     max_steps: int = 300000
     log_interval: int = 100

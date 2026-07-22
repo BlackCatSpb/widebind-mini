@@ -89,13 +89,12 @@ def train(cfg, data_dir, device):
     model = WideBindStack(cfg).to(device)
     n = model.param_count()
     print(f'Model: {n:,} params ({n/1e6:.2f}M)')
-    # torch.compile — ~30% tok/s на CUDA, fallback при ошибке
-    if device == 'cuda':
+    if getattr(cfg, 'compile', False):
         try:
             model = torch.compile(model, mode='reduce-overhead')
             print('  torch.compile: ON')
         except Exception:
-            print('  torch.compile: SKIP (fallback to eager)')
+            print('  torch.compile: SKIP')
     if device == 'cuda':
         print(f'  VRAM used: {torch.cuda.memory_allocated()/1e9:.2f} GB')
 
@@ -281,6 +280,7 @@ if __name__ == '__main__':
     parser.add_argument('--max-steps', type=int, default=300000, help='Training steps')
     parser.add_argument('--eval-interval', type=int, default=500, help='Eval every N steps')
     parser.add_argument('--save-interval', type=int, default=2000, help='Save every N steps')
+    parser.add_argument('--compile', action='store_true', help='Enable torch.compile (~30% tok/s)')
     parser.add_argument('--no-lambda', action='store_true', help='Disable lambda_d hierarchy')
     parser.add_argument('--accum', type=int, default=1, help='Gradient accumulation steps')
     parser.add_argument('--bind-twist-mode', default='shift', help='BottleneckBind twist mode (off/shift/cascade)')
@@ -305,6 +305,7 @@ if __name__ == '__main__':
         grad_clip=0.5,
         conv_kernel=48,
         accum_steps=args.accum,
+        compile=args.compile,
     )
 
     device = args.device if torch.cuda.is_available() else 'cpu'
