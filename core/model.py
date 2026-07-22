@@ -342,7 +342,7 @@ class GroupedCognitiveMirror(nn.Module):
         # Private memory bank: expert confident K-space states (cross-expert recall)
         self._has_private_mem = has_private_mem
         if has_private_mem:
-            self.register_buffer('_private_mem', torch.zeros(G, self.k))
+            self.register_buffer('_private_mem', torch.randn(G, self.k) * 0.01)
             # w_help init = log(3.0) -> sigmoid ~0.75: strong initial presence, prevents cold-start suppression
             self.w_help = nn.Parameter(torch.full((G, 1), math.log(3.0)))  # per-expert scale for recalled help
             self.w_contra = nn.Parameter(torch.full((G,), 0.01))  # small positive: disagreement opens gate by default
@@ -550,7 +550,7 @@ class GroupedCognitiveMirror(nn.Module):
                 social_pressure = 1.0 - 0.5 * torch.sigmoid(contra_expert_coll.clamp(min=0) + isolation_coll)
                 conf_plastic = conf * (1.0 - contra_u) * social_pressure
                 # Soft competition: temperature prevents winner-take-all monoculture
-                temp_write = 2.0  # >1 softens competition, <1 sharpens
+                temp_write = 0.5  # <1 softens competition (true soft), >1 sharpens
                 conf_soft = conf_plastic ** temp_write
                 conf_bc = conf_soft * self.G / (conf_soft.sum(dim=-2, keepdim=True) + 1e-8)
                 weighted_hp = (conf_bc * hp.detach()).mean(dim=(0, 1))
@@ -559,6 +559,7 @@ class GroupedCognitiveMirror(nn.Module):
                 warmup_rate = torch.sigmoid(3.0 - pm_scale)  # ~1.0 when pm~0, ~0.0 when pm>3
                 pm_decay = 0.999 - 0.009 * warmup_rate  # [0.990, 0.999] — faster decay when memory is empty
                 self._private_mem.mul_(pm_decay).add_(weighted_hp, alpha=1.0 - pm_decay)
+                self._private_mem.clamp_(-10.0, 10.0)
         
         # ─── Fast signals (hi half of K-space) ───
         # Smoothness: local coherence in K-space (CAUSAL: pad left only)
@@ -723,7 +724,9 @@ class BottleneckBind(nn.Module):
         super().__init__()
         self.D, self.K = D, K
         self.mode = getattr(cfg, "bind_twist_mode", "off")
-        self.S = 1 if self.mode == "off" else int(getattr(cfg, "bind_twist_S", 4))
+        self.S = int(getattr(cfg, "bind_twist_S", 4))
+        if self.mode == "off":
+            self.S = 1
         self.ocular = getattr(cfg, "bind_twist_ocular", "tied")
         self.gated = bool(getattr(cfg, "bind_twist_gate", False)) and self.mode != "off"
         scheme = getattr(cfg, "bind_twist_scheme", "golden")
@@ -740,6 +743,10 @@ class BottleneckBind(nn.Module):
         self.w_v = nn.Parameter(torch.empty(self.S, K))
         nn.init.normal_(self.w_u, 0.0, 1.0)
         nn.init.normal_(self.w_v, 0.0, 1.0)
+
+        # For shift mode with tie_bind, separate W_out per shift is needed for full rank S*K
+        if self.mode == "shift" and tie_bind and self.S > 1:
+            self.ocular = "multi"
 
         if self.mode != "off" and self.ocular == "multi" and self.S > 1:
             self.W_out = nn.Parameter(torch.empty(self.S, K, D))
@@ -1454,10 +1461,21 @@ class WideBindStack(nn.Module):
         if div_w > 0:
             all_ls = torch.cat([layer.mirror.log_scale for layer in self.layers])  # (L*G, d)
             div_loss = -div_w * all_ls.var(dim=0).mean()
+        # Signal balance: entropy regularization on signal weights (encourages uniform use of all signals)
+        signal_entropy = 0.0
+        n_sig = 0
+        for layer in self.layers:
+            w = torch.softmax(layer.mirror._signal_log_weights, dim=0)
+            signal_entropy = signal_entropy - (w * torch.log(w + 1e-10)).sum()
+            n_sig = n_sig + 1
+        if n_sig > 0:
+            signal_entropy = signal_entropy / n_sig
+        signal_entropy_weight = getattr(self.cfg, 'signal_entropy_weight', 0.001)
         return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss \
             + balance_weight * balance_loss + diversity_weight * diversity_loss \
             + nuc_weight * nuc_loss + orth_weight * orth_loss \
-            + w_m2v_weight * w_m2v_loss + branch_weight * branch_loss + div_loss
+            + w_m2v_weight * w_m2v_loss + branch_weight * branch_loss + div_loss \
+            - signal_entropy_weight * signal_entropy
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())

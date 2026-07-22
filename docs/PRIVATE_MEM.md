@@ -20,7 +20,7 @@
 - `contra = sigmoid(||hp - help_k||/||hp|| - 1)` — противоречие с коллективом
 - `social_pressure = 1 - 0.5*sigmoid(relu(contra_expert) + isolation)` — давление коллектива
 - `conf_plastic = conf * (1 - contra) * social_pressure` — итоговая запись
-- Soft-competition: `conf_bc = conf^T * G / sum(conf^T)` (T=2, не winner-take-all)
+- Soft-competition: `conf_bc = conf^T * G / sum(conf^T)` (T=0.5, T<1 сглаживает)
 - Adaptive decay: `decay = 0.990..0.999` (быстрый старт, медленная стабилизация)
 
 ### Layer 2: Arbiter (арбитр между Layer 0 и Layer 1)
@@ -73,7 +73,13 @@ Gate с 5 сигналами:
 2. **Cold start write** — w_help init 0 → sigmoid(0)=0.5, halving help_k.
    Fix: w_help init log(3) → sigmoid(1.1)=0.75.
 3. **Monoculture (winner-take-all write)** — один эксперт захватывает write budget.
-   Fix: soft-competition `conf^T / sum(conf^T)` с T=2.
+   Fix: soft-competition `conf^T / sum(conf^T)` с T=0.5 (T>1 заостряет, T<1 сглаживает).
 4. **Упорный скептик vs последовательный оппозиционер** — negative contra_expert
    не должен триггерить social_pressure. Fix: `relu(contra_expert)` перед sigmoid.
 5. **Adaptive decay** — быстрый старт при пустой памяти, медленный при стабильной.
+6. **Cold start private memory** — нулевая инициализация → attn@zeros=0.
+   Fix: `torch.randn(G, k) * 0.01`.
+7. **Signal imbalance** — help_k доминирует над остальными сигналами.
+   Fix: энтропийная регуляризация -H(ω) с весом 0.001.
+8. **Shift mode rank limitation** — tie_bind ограничивает ранг суммы до K.
+   Fix: при shift + tie_bind → multi ocular (отдельный W_out на сдвиг).

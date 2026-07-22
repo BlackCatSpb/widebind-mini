@@ -86,7 +86,7 @@ class WideBandConfig:
 
     # BottleneckBind twist: inter-channel bilinear mixing via golden-angle shifts
     bind_twist_mode: str = "off"         # "off" | "shift" | "cascade"
-    bind_twist_S: int = 1                # number of shifts (1 when mode=off)
+    bind_twist_S: int = 4                # number of shifts (overridden to 1 when mode=off)
     bind_twist_ocular: str = "tied"      # "tied" | "multi" — per-shift W_out
     bind_twist_scheme: str = "golden"    # "golden" | "fibonacci"
     bind_twist_gate: bool = False        # per-token adaptive aperture via hp
