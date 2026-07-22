@@ -413,7 +413,8 @@ class GroupedCognitiveMirror(nn.Module):
             self.W_out.copy_(self.W_proj.permute(0, 2, 1))
     
     def forward(self, h, mem_all, global_state=None, diff=None,
-                tanh_bias_mod=1.0, pred_scale_mod=None):
+                tanh_bias_mod=1.0, pred_scale_mod=None, context_mem=None,
+                allow_write=None):
         B, L, D = h.shape
         G, d, k = self.G, self.d, self.k
         
@@ -494,6 +495,10 @@ class GroupedCognitiveMirror(nn.Module):
             uncert = torch.sigmoid(pred_error.abs())  # (B, L, G, k)
             q = hp * uncert
             keys = self._private_mem.detach().clone()  # (G, k) — frozen snapshot for autograd
+            if context_mem is not None:
+                # Blend context override with learned memory (30% context, 70% learned)
+                keys = context_mem * 0.3 + keys * 0.7
+                keys = F.normalize(keys, dim=-1) * self._private_mem.norm(dim=-1, keepdim=True)
             attn = F.softmax(q @ keys.T / math.sqrt(self.k), dim=-1)  # (B, L, G, G)
             help_k_base = attn @ keys  # (B, L, G, k) — collective confident memory
             # ─── Contradiction gate: disagreement between expert hp and collective help_k ───
@@ -541,7 +546,8 @@ class GroupedCognitiveMirror(nn.Module):
                 self._cached_isolation = isolation
         
         # ─── Private Memory: write confident K-space states (contradiction-aware) ───
-        if self._has_private_mem and self.training:
+        _write = self._has_private_mem and (self.training if allow_write is None else allow_write)
+        if _write:
             with torch.no_grad():
                 conf = torch.sigmoid(-pred_error.abs().mean(dim=-1, keepdim=True))
                 contra_u = contra.unsqueeze(-1)
@@ -681,6 +687,36 @@ class GroupedCognitiveMirror(nn.Module):
                 self._prev_grad_norm.copy_(g_norms)
         else:
             self._prev_grad_norm.copy_(self._hp_grad)
+
+    @torch.no_grad()
+    def debug_mind(self):
+        """Return a dict of meta-cognitive stats for generation interpretability.
+        Works in eval mode — computes KG stats on-demand if not cached."""
+        info = {}
+        if not self._has_private_mem:
+            return info
+        info['private_mem_norm'] = self._private_mem.norm(dim=-1).mean().item()
+        info['w_help'] = torch.sigmoid(self.w_help).mean().item()
+        info['w_contra'] = self.w_contra.mean().item()
+        w = torch.softmax(self._signal_log_weights, dim=0)
+        for i, label in enumerate(['temp','pred','smooth','sym','help'][:len(w)]):
+            info[f'signal_w_{label}'] = w[i].item()
+        if self._cached_contra_expert is not None:
+            info['contra_expert'] = self._cached_contra_expert.mean().item()
+            info['contra_expert_raw'] = self._cached_contra_expert.tolist()
+        if self._cached_contra_graph is not None:
+            info['contra_graph_mean'] = self._cached_contra_graph.mean().item()
+        if self._cached_dominance is not None:
+            info['dominance'] = self._cached_dominance.tolist()
+        if self._cached_isolation is not None:
+            info['isolation'] = self._cached_isolation.tolist()
+        if self._cached_concept_dendrogram is not None:
+            info['concept_q_hi'], info['concept_q_lo'] = self._cached_concept_dendrogram
+        tm = self._trust_matrix
+        info['trust_max'] = tm.max().item()
+        info['trust_min'] = tm[tm > 0].min().item() if (tm > 0).any() else 0.0
+        info['trust_diag'] = tm.diag().mean().item()
+        return info
 
 
 def migrate_bind_state_dict(sd, n_layers, mode="off", S=1):
@@ -992,7 +1028,8 @@ class WideBindBlock(nn.Module):
     
     def forward(self, h, state=None, global_state=None,
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,
-                tanh_bias_mod=1.0, pred_scale_mod=None, spectral_mod=1.0):
+                tanh_bias_mod=1.0, pred_scale_mod=None, spectral_mod=1.0,
+                context_mem=None, allow_write=None):
         mem_state = mu_state = conv_state = None
         if state is not None:
             mem_state, mu_state, conv_state = state
@@ -1134,7 +1171,8 @@ class WideBindBlock(nn.Module):
         # ─── Mirror (self-consistency: local + global) ───
         mirror, mlp_mod, mem_mod = self.mirror(
             h, mem_all, global_state=global_state, diff=diff,
-            tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod)
+            tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
+            context_mem=context_mem, allow_write=allow_write)
         
         # ─── Output (adaptive memory scale, per-group modulation) ───
         # mem_mod: per-token, per-expert gating of memory contribution
@@ -1183,7 +1221,8 @@ class WideBindStack(nn.Module):
         # EMA for exploration (smoothed over ~500 steps)
         self.register_buffer('_expl_ema', torch.zeros(1), persistent=False)
     
-    def forward(self, h, state=None, global_state=None, pred_weight=None, adaptive=True):
+    def forward(self, h, state=None, global_state=None, pred_weight=None, adaptive=True,
+                context_mem=None, allow_write=None):
         """h: (B, L, D) — pre-embedded tokens
            state: per-layer memory states from previous forward (or None)
            global_state: cross-layer EMA self-model (or None, created fresh)
@@ -1265,7 +1304,8 @@ class WideBindStack(nn.Module):
             h, s_out = layer(h, s, global_state=gs_i,
                              mem2v_scale=mem2v_scale, diff=l_diff, noise_scale=nscale,
                              tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
-                             spectral_mod=spectral_mod)
+                             spectral_mod=spectral_mod,
+                             context_mem=context_mem, allow_write=allow_write)
             if s_out is not None:
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
