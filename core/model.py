@@ -547,6 +547,7 @@ class GroupedCognitiveMirror(nn.Module):
         
         # ─── Private Memory: write confident K-space states (contradiction-aware) ───
         _write = self._has_private_mem and (self.training if allow_write is None else allow_write)
+        _write = _write and self._alpha_override.item() < 0.01  # delay until after warmup
         if _write:
             with torch.no_grad():
                 conf = torch.sigmoid(-pred_error.abs().mean(dim=-1, keepdim=True))
