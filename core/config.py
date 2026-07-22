@@ -93,6 +93,7 @@ class WideBandConfig:
 
     accum_steps: int = 1
     compile: bool = False
+    div_weight: float = 0.0  # expert diversity (var(log_scale) bonus)
 
     max_steps: int = 300000
     log_interval: int = 100

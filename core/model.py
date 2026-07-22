@@ -323,7 +323,10 @@ class GroupedCognitiveMirror(nn.Module):
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         # EMA norms for signal normalization (Proposal V-1)
         self.register_buffer('_signal_norm_ema', torch.ones(4, G, k) * 3.0, persistent=False)
-        self.log_scale = nn.Parameter(torch.randn(G, self.d) * log_scale_init_std)
+        # Asymmetric init: guaranties non-zero var(log_scale) from step 0.
+        # Without it, diversity loss has zero gradient at init (cold start).
+        ls_base = torch.linspace(-0.2, 0.2, G).unsqueeze(1).expand(G, self.d)
+        self.log_scale = nn.Parameter(ls_base + torch.randn(G, self.d) * 0.05)
         
         # ─── K-space gate (per-token, per-expert from hp) ───
         # w_gate: (G, k) — maps |pred_error| to gate logit per expert
@@ -1344,10 +1347,16 @@ class WideBindStack(nn.Module):
         diversity_weight = getattr(self.cfg, 'diversity_weight', 0.001)
         nuc_weight = getattr(self.cfg, 'nuclear_weight', 1e-5)
         orth_weight = getattr(self.cfg, 'orth_weight', 1e-4)
+        # Mirror diversity: push var(log_scale) up (expert specialization)
+        div_w = getattr(self.cfg, 'div_weight', 0.0)
+        div_loss = 0.0
+        if div_w > 0:
+            all_ls = torch.cat([layer.mirror.log_scale for layer in self.layers])  # (L*G, d)
+            div_loss = -div_w * all_ls.var(dim=0).mean()
         return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss \
             + balance_weight * balance_loss + diversity_weight * diversity_loss \
             + nuc_weight * nuc_loss + orth_weight * orth_loss \
-            + w_m2v_weight * w_m2v_loss + branch_weight * branch_loss
+            + w_m2v_weight * w_m2v_loss + branch_weight * branch_loss + div_loss
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())

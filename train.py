@@ -281,6 +281,7 @@ if __name__ == '__main__':
     parser.add_argument('--eval-interval', type=int, default=500, help='Eval every N steps')
     parser.add_argument('--save-interval', type=int, default=2000, help='Save every N steps')
     parser.add_argument('--compile', action='store_true', help='Enable torch.compile (~30% tok/s)')
+    parser.add_argument('--div-weight', type=float, default=0.0, help='Expert diversity loss weight (pushes var(log_scale) up)')
     parser.add_argument('--no-lambda', action='store_true', help='Disable lambda_d hierarchy')
     parser.add_argument('--accum', type=int, default=1, help='Gradient accumulation steps')
     parser.add_argument('--bind-twist-mode', default='shift', help='BottleneckBind twist mode (off/shift/cascade)')
@@ -306,6 +307,7 @@ if __name__ == '__main__':
         conv_kernel=48,
         accum_steps=args.accum,
         compile=args.compile,
+        div_weight=args.div_weight,
     )
 
     device = args.device if torch.cuda.is_available() else 'cpu'
