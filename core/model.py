@@ -1980,8 +1980,8 @@ class MirrorLRScheduler:
             # Magnitude cap: |mirror| above threshold reduces LR (counter-cyclical)
             mag_factor = min(1.0, max(0.2, self.mag_threshold / max(mag, 1e-10)))
 
-            mirror_mult = var_mult * alpha_mult * gate_mult * mag_factor
-            mult = max(0.05, min(3.0, mirror_mult))
+            mirror_mult = min(var_mult, alpha_mult, gate_mult) * mag_factor
+            mult = max(0.05, min(1.0, mirror_mult))
 
             # Persistent loss damping applied every step
             mult *= self._loss_lr_factor
