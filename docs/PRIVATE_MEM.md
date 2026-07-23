@@ -83,3 +83,15 @@ Gate с 5 сигналами:
    Fix: энтропийная регуляризация -H(ω) с весом 0.001.
 8. **Shift mode rank limitation** — tie_bind ограничивает ранг суммы до K.
    Fix: при shift + tie_bind → multi ocular (отдельный W_out на сдвиг).
+
+---
+
+## Cross-Reference: Main Variant
+
+Полная WideBind (D=4096, L=32, G=32, ~161M) использует ту же трёхслойную архитектуру
+Meta-Knowledge Layer с G=32 экспертами. Все механизмы (conf, contra, social_pressure,
+soft-competition, adaptive decay) идентичны.
+
+Перенос наставников: 8 мини-экспертов → первые 8 слотов каждого 8-го слоя Main,
+остальные 24 — randn инициализация. См. `../scripts/extract_experts.py` после завершения
+тренировки Mini.

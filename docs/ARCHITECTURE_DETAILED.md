@@ -1,6 +1,6 @@
 # WideBind Mini: Архитектурный обзор
 
-**12.23M параметров, 12 слоёв, D=896, 8 экспертов.**
+**11.20M параметров (default, S=1) / 12.23M (multi-ocular S=4), 12 слоёв, D=896, 8 экспертов.**
 
 Модель-полигон для трёхслойного дифференцируемого аппарата саморефлексии.
 Знание (L0) → Мета-знание (L1) → Арбитр (L2).
@@ -627,20 +627,37 @@ Total for 12 layers: 9,633,792 (78.73% от модели с multi-ocular)
 
 ---
 
-## 10. Параметры (полные, D=896, L=12, S=4)
+## 10. Параметры
+
+Два варианта конфигурации BottleneckBind:
+
+### 10.1 Default (S=1, bind_twist_mode=off)
 
 | Компонент | Параметров | % |
 |-----------|-----------|----|
-| Embed + LM Head | 8,192 | 0.07 |
-| BottleneckBind (S=4, multi) | 1,723,392 | 14.09 |
-| GroupedCognitiveMirror | 732,096 | 5.98 |
-| Conv1d (k=48) | 43,008 | 0.35 |
-| DCT Spectral | 10,752 | 0.09 |
-| VSA gates | 215,040 | 1.76 |
-| GroupedMLP (expand=4) | 9,633,792 | 78.73 |
-| **Total** | **~12,230,272** | **100** |
+| Embed + LM Head | 51,920 | 0.46 |
+| BottleneckBind (K=32, S=1) | 689,280 | 6.16 |
+| GroupedCognitiveMirror | 124,456 | 1.11 |
+| Conv1d (k=48) | 516,096 | 4.61 |
+| DCT Spectral | 10,752 | 0.10 |
+| VSA Gates | 150,540 | 1.34 |
+| Private Memory | 10,752 | 0.10 |
+| GroupedMLP (expand=4) | 9,644,544 | 86.12 |
+| **Total** | **~11,198,340** | **100** |
 
-При `--private-mem`: дополнительно ~1K параметров (w_help + w_contra + buffers) — пренебрежимо мало.
+### 10.2 Multi-Ocular (S=4, bind_twist_mode=shift)
+
+| Компонент | Параметров | % |
+|-----------|-----------|----|
+| Embed + LM Head | 51,920 | 0.42 |
+| BottleneckBind (S=4, multi) | 1,723,392 | 14.09 |
+| GroupedCognitiveMirror | 124,456 | 1.02 |
+| Conv1d (k=48) | 516,096 | 4.22 |
+| DCT Spectral | 10,752 | 0.09 |
+| VSA Gates | 150,540 | 1.23 |
+| Private Memory | 10,752 | 0.09 |
+| GroupedMLP (expand=4) | 9,644,544 | 78.84 |
+| **Total** | **~12,232,452** | **100** |
 
 ---
 
