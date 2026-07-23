@@ -1516,7 +1516,6 @@ class WideBindStack(nn.Module):
         # Benefit loss: anchor log_scale to gate-implied expert utility
         benefit_weight = getattr(self.cfg, 'benefit_weight', 1.0)
         benefit_loss = 0.0
-        n_bn = 0
         if benefit_weight > 0:
             for layer in self.layers:
                 bn = getattr(layer.mirror, '_cached_benefit', None)
@@ -1527,9 +1526,6 @@ class WideBindStack(nn.Module):
                         span = ls_mean.std().clamp(min=0.01)
                     target = bn * span * 2
                     benefit_loss = benefit_loss + (ls_mean - target).pow(2).sum()
-                    n_bn = n_bn + 1
-            if n_bn > 0:
-                benefit_loss = benefit_loss / n_bn
         # Signal balance: entropy regularization on signal weights (encourages uniform use of all signals)
         signal_entropy = 0.0
         n_sig = 0
