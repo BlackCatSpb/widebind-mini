@@ -1514,7 +1514,7 @@ class WideBindStack(nn.Module):
             all_ls = torch.cat([layer.mirror.log_scale for layer in self.layers])  # (L*G, d)
             div_loss = -div_w * all_ls.var()
         # Benefit loss: anchor log_scale to gate-implied expert utility
-        benefit_weight = getattr(self.cfg, 'benefit_weight', 1.0)
+        benefit_weight = getattr(self.cfg, 'benefit_weight', 5.0)
         benefit_loss = 0.0
         if benefit_weight > 0:
             for layer in self.layers:
@@ -1524,8 +1524,10 @@ class WideBindStack(nn.Module):
                     ls_mean = ls.mean(dim=-1)
                     with torch.no_grad():
                         span = ls_mean.std().clamp(min=0.01)
+                        bm = bn.abs().mean().clamp(max=0.5)
+                    effective = benefit_weight * bm * 2
                     target = bn * span * 2
-                    benefit_loss = benefit_loss + (ls_mean - target).pow(2).sum()
+                    benefit_loss = benefit_loss + effective * (ls_mean - target).pow(2).sum()
         # Signal balance: entropy regularization on signal weights (encourages uniform use of all signals)
         signal_entropy = 0.0
         n_sig = 0
