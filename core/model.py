@@ -357,6 +357,8 @@ class GroupedCognitiveMirror(nn.Module):
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
         self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
+        # Gate EMA: gradual wakeup for mirror, cold-start at zero (self-adaptive per-expert warmup)
+        self.register_buffer('_gate_ema', torch.zeros(G), persistent=True)
         # Alpha override: set to 0.5 during warmup to force large pred_error
         # 0.0 = use learned alpha; >0 = override alpha for all experts
         self.register_buffer('_alpha_override', torch.zeros(1), persistent=False)
@@ -648,7 +650,7 @@ class GroupedCognitiveMirror(nn.Module):
         linear = torch.einsum('blgk,gkd->blgd', delta, self.W_out)  # (B, L, G, d)
         skip_alpha = torch.exp(self.log_skip_alpha).view(1, 1, G, 1)
         mirror = torch.tanh(linear) + skip_alpha * linear
-        mirror = mirror * torch.exp(self.log_scale)  # per-dim scale
+        mirror = mirror * torch.exp(self.log_scale * self._gate_ema.unsqueeze(-1))
         
         # ─── K-Space Gate (per-token, per-expert) ───
         gate_signal = torch.abs(pred_error)  # (B, L, G, k)
@@ -671,6 +673,8 @@ class GroupedCognitiveMirror(nn.Module):
         self._cached_gate_l1 = expert_gate.mean()
         # Cache per-expert mean gate for load balancing loss
         self._cached_gate_usage = expert_gate.mean(dim=(0, 1))  # (G,)
+        # Gate EMA: self-adaptive per-expert warmup for mirror (cold → full over ~5000 steps)
+        self._gate_ema.mul_(0.999).add_(self._cached_gate_usage.detach(), alpha=0.001)
         # Cache for expert reinforcement loss (gate vs usefulness alignment)
         self._cached_usefulness = usefulness
         self._cached_gate = expert_gate.detach()
@@ -718,10 +722,13 @@ class GroupedCognitiveMirror(nn.Module):
             info['isolation'] = self._cached_isolation.tolist()
         if self._cached_concept_dendrogram is not None:
             info['concept_q_hi'], info['concept_q_lo'] = self._cached_concept_dendrogram
-        tm = self._trust_matrix
-        info['trust_max'] = tm.max().item()
-        info['trust_min'] = tm[tm > 0].min().item() if (tm > 0).any() else 0.0
-        info['trust_diag'] = tm.diag().mean().item()
+        info['gate_ema'] = self._gate_ema.tolist()
+        info['gate_ema_mean'] = self._gate_ema.mean().item()
+        if self._has_private_mem:
+            tm = self._trust_matrix
+            info['trust_max'] = tm.max().item()
+            info['trust_min'] = tm[tm > 0].min().item() if (tm > 0).any() else 0.0
+            info['trust_diag'] = tm.diag().mean().item()
         return info
 
 

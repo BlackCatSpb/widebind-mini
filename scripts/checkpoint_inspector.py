@@ -128,6 +128,9 @@ def print_report(info, file=None):
         if 'pm_step' in info:
             cur, max_ = info['pm_step']
             out.append(f"pm_step: {cur}/{max_}")
+        if 'gate_ema' in info:
+            ge = info['gate_ema']
+            out.append(f"gate_ema: mean={ge.mean():.3f} min={ge.min():.3f} max={ge.max():.3f}")
 
     text = '\n'.join(out)
     if file is None:
