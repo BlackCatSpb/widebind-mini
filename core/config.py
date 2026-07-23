@@ -72,8 +72,8 @@ class WideBandConfig:
     cov_tau_hi: int = 200
 
     gate_l1_weight: float = 0.001
-    reinforce_weight: float = 0.01
-    balance_weight: float = 0.01
+    reinforce_weight: float = 0.001
+    balance_weight: float = 0.001
     diversity_weight: float = 0.001
     nuclear_weight: float = 1e-5
     orth_weight: float = 1e-4
@@ -93,7 +93,7 @@ class WideBandConfig:
 
     accum_steps: int = 1
     compile: bool = False
-    div_weight: float = 0.01  # expert diversity: sum-of-squares push, no /N (0=disabled)
+    div_weight: float = 0.0001  # expert diversity: var-based push, no /N (0=disabled)
     ranking_weight: float = 0.1  # pairwise order ls_mean by gate_usage (0=disabled)
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
     signal_entropy_weight: float = 0.001  # entropy regularization on signal weights (0=disabled)

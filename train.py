@@ -214,8 +214,12 @@ def train(cfg, data_dir, device):
                     idiff = gvar = ls_var = 0.0
                 lr = scheduler.get_last_lr()[0]
                 mem_gb = torch.cuda.max_memory_allocated() / 1e9 if device == 'cuda' else 0
+                # Individual aux losses from compute_loss cache
+                lc = getattr(model, '_cached_losses', {})
+                aux_str = ' '.join(f'{k}={v:.4f}' for k, v in lc.items())
                 print(f'step={step:>6} loss={loss.item()*accum:.4f} |1-a|={idiff:.4f} '
-                      f'g_var={gvar:.4f} ls_var={ls_var:.4f} lr={lr:.2e} tok/s={tokens/dt:.0f} mem={mem_gb:.2f}GB')
+                      f'g_var={gvar:.4f} ls_var={ls_var:.4f} lr={lr:.2e} tok/s={tokens/dt:.0f} '
+                      f'mem={mem_gb:.2f}GB | {aux_str}')
                 if device == 'cuda':
                     torch.cuda.reset_peak_memory_stats()
 

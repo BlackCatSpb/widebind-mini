@@ -667,6 +667,13 @@ class GroupedCognitiveMirror(nn.Module):
             if self._cached_contra_expert is not None:
                 ce = self._cached_contra_expert.to(gate_logits.device).unsqueeze(0).unsqueeze(0)
                 gate_logits = gate_logits + ce  # collective contradiction raises gate
+            # Soft routing overlay: specialization + consensus modulate gate via w_contra
+            spec = self._behavior_div_ema.mean(dim=-1)            # (G,) — avg divergence per expert
+            spec = spec / (spec.max() + 1e-10)                    # norm to [0, 1]
+            cons = self._concept_sim_ema.mean(dim=-1)             # (G,) — avg similarity per expert
+            cons = cons / (cons.max() + 1e-10)                    # norm to [0, 1]
+            gate_bonus = (spec * 0.5 + cons * 0.5) * self.w_contra * 0.1
+            gate_logits = gate_logits + gate_bonus.unsqueeze(0).unsqueeze(0)
         
         expert_gate = torch.sigmoid(gate_logits)  # (B, L, G)
         # Cache gate L1 for auxiliary sparsity loss (still in graph for gradients)
@@ -724,11 +731,25 @@ class GroupedCognitiveMirror(nn.Module):
             info['concept_q_hi'], info['concept_q_lo'] = self._cached_concept_dendrogram
         info['gate_ema'] = self._gate_ema.tolist()
         info['gate_ema_mean'] = self._gate_ema.mean().item()
+        # ─── Специализация экспертов ───
+        info['gate_selectivity'] = self._last_gates.std().item()
+        info['ls_var'] = self.log_scale.var(dim=-1).tolist()
+        info['ls_var_mean'] = self.log_scale.var(dim=-1).mean().item()
         if self._has_private_mem:
             tm = self._trust_matrix
             info['trust_max'] = tm.max().item()
             info['trust_min'] = tm[tm > 0].min().item() if (tm > 0).any() else 0.0
             info['trust_diag'] = tm.diag().mean().item()
+            # Behavior diversity per expert (mean pairwise divergence)
+            info['behavior_div'] = self._behavior_div_ema.mean(dim=-1).tolist()
+            # Concept similarity per expert
+            info['concept_sim'] = self._concept_sim_ema.mean(dim=-1).tolist()
+            # Composite indices
+            bd = self._behavior_div_ema.mean(dim=-1)
+            cs = self._concept_sim_ema.mean(dim=-1)
+            tr = self._trust_matrix.mean(dim=-1)
+            info['spec_index'] = (self._last_gates * bd).tolist()
+            info['cons_index'] = (cs * tr).tolist()
         return info
 
 
@@ -1513,7 +1534,7 @@ class WideBindStack(nn.Module):
         div_loss = 0.0
         if div_w > 0:
             all_ls = torch.cat([layer.mirror.log_scale.reshape(-1) for layer in self.layers])
-            div_loss = -div_w * ((all_ls - all_ls.mean()) ** 2).sum()
+            div_loss = -div_w * all_ls.var()
         # Ranking loss: order ls_mean by gate_usage (contrastive, no /N dilution)
         ranking_weight = getattr(self.cfg, 'ranking_weight', 0.0)
         ranking_loss = 0.0
@@ -1547,6 +1568,18 @@ class WideBindStack(nn.Module):
             n_ls = n_ls + 1
         if n_ls > 0:
             log_scale_reg = log_scale_reg / n_ls
+        # Cache individual losses for monitoring (read by train.py)
+        self._cached_losses = {
+            'ce': ce_loss.item(),
+            'pred': pred_loss.item() if isinstance(pred_loss, torch.Tensor) else pred_loss,
+            'gate_l1': gate_l1.item() if isinstance(gate_l1, torch.Tensor) else gate_l1,
+            'reinforce': reinforce_loss.item() if isinstance(reinforce_loss, torch.Tensor) else reinforce_loss,
+            'balance': balance_loss.item() if isinstance(balance_loss, torch.Tensor) else balance_loss,
+            'div': div_loss.item() if isinstance(div_loss, torch.Tensor) else div_loss,
+            'ranking': ranking_loss.item() if isinstance(ranking_loss, torch.Tensor) else ranking_loss,
+            'signal_ent': signal_entropy.item() if isinstance(signal_entropy, torch.Tensor) else signal_entropy,
+            'ls_reg': log_scale_reg.item() if isinstance(log_scale_reg, torch.Tensor) else log_scale_reg,
+        }
         return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss \
             + balance_weight * balance_loss + diversity_weight * diversity_loss \
             + nuc_weight * nuc_loss + orth_weight * orth_loss \
