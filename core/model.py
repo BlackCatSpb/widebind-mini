@@ -674,7 +674,7 @@ class GroupedCognitiveMirror(nn.Module):
         # Cache per-expert mean gate for load balancing loss
         self._cached_gate_usage = expert_gate.mean(dim=(0, 1))  # (G,)
         # Gate EMA: self-adaptive per-expert warmup for mirror (cold → full over ~5000 steps)
-        self._gate_ema.mul_(0.999).add_(self._cached_gate_usage.detach(), alpha=0.001)
+        self._gate_ema.data.mul_(0.999).add_(self._cached_gate_usage.detach(), alpha=0.001)
         # Cache for expert reinforcement loss (gate vs usefulness alignment)
         self._cached_usefulness = usefulness
         self._cached_gate = expert_gate.detach()
