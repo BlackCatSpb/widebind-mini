@@ -93,7 +93,7 @@ class WideBandConfig:
 
     accum_steps: int = 1
     compile: bool = False
-    div_weight: float = 0.0  # expert diversity (var(log_scale) bonus)
+    div_weight: float = 0.5  # expert diversity (var(log_scale) bonus)
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
     signal_entropy_weight: float = 0.001  # entropy regularization on signal weights (0=disabled)
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion

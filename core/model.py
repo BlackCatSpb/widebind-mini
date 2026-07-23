@@ -323,10 +323,10 @@ class GroupedCognitiveMirror(nn.Module):
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         # EMA norms for signal normalization (Proposal V-1)
         n_signals = 5 if has_private_mem else 4
-        self.register_buffer('_signal_norm_ema', torch.ones(n_signals, G, k) * 3.0, persistent=False)
+        self.register_buffer('_signal_norm_ema', torch.ones(n_signals, G, k), persistent=False)
         # Asymmetric init: guaranties non-zero var(log_scale) from step 0.
         # Without it, diversity loss has zero gradient at init (cold start).
-        ls_base = torch.linspace(-0.2, 0.2, G).unsqueeze(1).expand(G, self.d)
+        ls_base = torch.linspace(-1.0, 1.0, G).unsqueeze(1).expand(G, self.d)
         self.log_scale = nn.Parameter(ls_base + torch.randn(G, self.d) * 0.05)
         
         # ─── K-space gate (per-token, per-expert from hp) ───
@@ -1505,7 +1505,7 @@ class WideBindStack(nn.Module):
         div_loss = 0.0
         if div_w > 0:
             all_ls = torch.cat([layer.mirror.log_scale for layer in self.layers])  # (L*G, d)
-            div_loss = -div_w * all_ls.var(dim=0).mean()
+            div_loss = -div_w * all_ls.var()
         # Signal balance: entropy regularization on signal weights (encourages uniform use of all signals)
         signal_entropy = 0.0
         n_sig = 0
