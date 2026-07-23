@@ -391,6 +391,9 @@ class GroupedCognitiveMirror(nn.Module):
 
         # ─── Learnable signal weights (softmax-normalized) ───
         self._signal_log_weights = nn.Parameter(torch.zeros(n_signals))
+        # Benefit EMA: smoothed gate-utility signal for log_scale anchoring
+        self.register_buffer('_benefit_ema', torch.zeros(G))
+        self._cached_benefit = None
         
         # ─── Self-organizing usefulness predictor (competitive) ───
         # Каждый эксперт предсказывает свою полезность по delta (K-space correction)
@@ -670,6 +673,10 @@ class GroupedCognitiveMirror(nn.Module):
         self._cached_gate_l1 = expert_gate.mean()
         # Cache per-expert mean gate for load balancing loss
         self._cached_gate_usage = expert_gate.mean(dim=(0, 1))  # (G,)
+        # Benefit signal: zero-meaned gate utility for log_scale anchoring
+        benefit = self._cached_gate_usage - self._cached_gate_usage.mean()
+        self._benefit_ema.mul_(0.999).add_(benefit.detach(), alpha=0.001)
+        self._cached_benefit = self._benefit_ema.clone()
         # Cache for expert reinforcement loss (gate vs usefulness alignment)
         self._cached_usefulness = usefulness
         self._cached_gate = expert_gate.detach()
@@ -1506,6 +1513,23 @@ class WideBindStack(nn.Module):
         if div_w > 0:
             all_ls = torch.cat([layer.mirror.log_scale for layer in self.layers])  # (L*G, d)
             div_loss = -div_w * all_ls.var()
+        # Benefit loss: anchor log_scale to gate-implied expert utility
+        benefit_weight = getattr(self.cfg, 'benefit_weight', 1.0)
+        benefit_loss = 0.0
+        n_bn = 0
+        if benefit_weight > 0:
+            for layer in self.layers:
+                bn = getattr(layer.mirror, '_cached_benefit', None)
+                if bn is not None:
+                    ls = layer.mirror.log_scale
+                    ls_mean = ls.mean(dim=-1)
+                    with torch.no_grad():
+                        span = ls_mean.std().clamp(min=0.01)
+                    target = bn * span * 2
+                    benefit_loss = benefit_loss + (ls_mean - target).pow(2).sum()
+                    n_bn = n_bn + 1
+            if n_bn > 0:
+                benefit_loss = benefit_loss / n_bn
         # Signal balance: entropy regularization on signal weights (encourages uniform use of all signals)
         signal_entropy = 0.0
         n_sig = 0
@@ -1530,6 +1554,7 @@ class WideBindStack(nn.Module):
             + balance_weight * balance_loss + diversity_weight * diversity_loss \
             + nuc_weight * nuc_loss + orth_weight * orth_loss \
             + w_m2v_weight * w_m2v_loss + branch_weight * branch_loss + div_loss \
+            + benefit_weight * benefit_loss \
             - signal_entropy_weight * signal_entropy \
             + log_scale_l2_weight * log_scale_reg
     
