@@ -146,3 +146,24 @@ gradients. d dimensions cannot differentiate from benefit_loss alone.
 4. Should we use learnable per-expert bias for log_scale init within linspace?
    Each expert gets `ls_init_g = uniform(-1, 1)` instead of linspace.
    More random, less structured, but still provides variance.
+
+---
+
+## VI. Applied Solution (audit-based)
+
+| Change | File | Rationale |
+|--------|------|-----------|
+| log_scale init: `linspace(-0.3, 0.3)` | `model.py:329` | exp ∈ [0.74, 1.35], ls_var≈0.04, no destabilization |
+| div_loss: sum-of-squares `((ls-m)**2).sum()` | `model.py:1514` | gradient = `-div_w·2·(ls-m)`, no ÷N |
+| ranking_loss: pairwise by gate_usage | `model.py:1517-1530` | O(G²) pairs, each O(1), works at cold start |
+| div_weight: 0.5→0.01 | `config.py:96` | sum-of-squares not normalized, needs smaller weight |
+| benefit_weight removed → `ranking_weight: 0.1` | `config.py:97` | ranking replaces MSE-based benefit anchor |
+
+**Theory**: div_loss (sum-of-squares) pushes all ls elements apart (per-dim specialization).
+ranking_loss orders per-expert means by gate_usage. They don't conflict:
+div_loss widens spread, ranking_loss aligns the ordering with expert utility.
+
+**Monitoring**:
+- ls_var: 0.04 → 0.1+ by step 5000
+- loss: should stabilize at 10-12 (not 60+) since exp(0.3)=1.35 max
+- ranking_loss: should decrease as ls_mean aligns with gate_usage
