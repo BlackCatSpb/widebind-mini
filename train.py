@@ -285,7 +285,7 @@ if __name__ == '__main__':
     parser.add_argument('--eval-interval', type=int, default=500, help='Eval every N steps')
     parser.add_argument('--save-interval', type=int, default=2000, help='Save every N steps')
     parser.add_argument('--compile', action='store_true', help='Enable torch.compile (~30% tok/s)')
-    parser.add_argument('--div-weight', type=float, default=0.0001, help='Expert diversity loss weight (pushes var(log_scale) up)')
+    parser.add_argument('--div-weight', type=float, default=0.087, help='Expert diversity loss weight (pushes var(log_scale) up)')
     parser.add_argument('--private-mem', action='store_true', help='Enable cross-expert private memory bank')
     parser.add_argument('--no-lambda', action='store_true', help='Disable lambda_d hierarchy')
     parser.add_argument('--accum', type=int, default=1, help='Gradient accumulation steps')
