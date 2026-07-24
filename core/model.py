@@ -335,7 +335,7 @@ class GroupedCognitiveMirror(nn.Module):
         self.w_gate = nn.Parameter(torch.randn(G, self.k) * gate_std)
         self.b_gate = nn.Parameter(torch.zeros(G))
         # w_delta_gate: (G, k) — maps delta (correction) to gate logit
-        self.w_delta_gate = nn.Parameter(torch.randn(G, self.k) * 0.01)
+        self.w_delta_gate = nn.Parameter(torch.randn(G, self.k) / math.sqrt(self.k))
         
         # External gradient cache (устанавливается hook'ом после backward)
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
@@ -1063,7 +1063,11 @@ class WideBindBlock(nn.Module):
     def forward(self, h, state=None, global_state=None,
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,
                 tanh_bias_mod=1.0, pred_scale_mod=None, spectral_mod=1.0,
-                context_mem=None, allow_write=None):
+                context_mem=None, allow_write=None, phase=1):
+        """phase=1: base only (mirror frozen)
+                 2: base detached, mirror learns residual via CE
+                 3: all active, joint fine-tuning
+        """
         mem_state = mu_state = conv_state = None
         if state is not None:
             mem_state, mu_state, conv_state = state
@@ -1203,10 +1207,15 @@ class WideBindBlock(nn.Module):
         mu_state_out = mu_state_out_vec.reshape(B, S * D)
         
         # ─── Mirror (self-consistency: local + global) ───
-        mirror, mlp_mod, mem_mod = self.mirror(
-            h, mem_all, global_state=global_state, diff=diff,
-            tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
-            context_mem=context_mem, allow_write=allow_write)
+        if phase == 1:
+            mirror = torch.zeros_like(h)
+            mlp_mod = torch.zeros(B, L, self.mirror.G, device=h.device, dtype=h.dtype)
+            mem_mod = torch.zeros(B, L, self.mirror.G, device=h.device, dtype=h.dtype)
+        else:
+            mirror, mlp_mod, mem_mod = self.mirror(
+                h, mem_all, global_state=global_state, diff=diff,
+                tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
+                context_mem=context_mem, allow_write=allow_write)
         
         # ─── Output (adaptive memory scale, per-group modulation) ───
         # mem_mod: per-token, per-expert gating of memory contribution
@@ -1215,8 +1224,11 @@ class WideBindBlock(nn.Module):
         g = self.mirror.G
         d = self.mirror.d
         mem_modulated = (mem_read.reshape(B, L, g, d) * mm).reshape(B, L, D)
-        enhanced = bind_out + mem_modulated * self.w_mem2v * mem2v_scale + mirror
-        self._cache_bind_out = (bind_out + mem_modulated * self.w_mem2v * mem2v_scale).detach()
+        enhanced_base = bind_out + mem_modulated * self.w_mem2v * mem2v_scale
+        if phase == 2:
+            enhanced_base = enhanced_base.detach()
+        enhanced = enhanced_base + mirror
+        self._cache_bind_out = enhanced_base.detach()
         self._cache_mirror_out = mirror.detach()
         h = h + enhanced
         
@@ -1255,13 +1267,54 @@ class WideBindStack(nn.Module):
         # EMA for exploration (smoothed over ~500 steps)
         self.register_buffer('_expl_ema', torch.zeros(1), persistent=False)
     
+    def set_phase(self, phase):
+        """Set training phase for all blocks. Manages requires_grad and freezes.
+        phase=1: base only — mirror frozen, conv/bind/vsa/mlp trainable
+        phase=2: base detached — mirror trainable, base frozen
+        phase=3: joint — all trainable
+        """
+        for layer in self.layers:
+            if phase == 1:
+                for p in layer.mirror.parameters():
+                    p.requires_grad = False
+                for p in layer.conv.parameters():
+                    p.requires_grad = True
+                for p in layer.bind.parameters():
+                    p.requires_grad = True
+                for p in layer.mlp.parameters():
+                    p.requires_grad = True
+            elif phase == 2:
+                for p in layer.mirror.parameters():
+                    p.requires_grad = True
+                for p in layer.conv.parameters():
+                    p.requires_grad = False
+                for p in layer.bind.parameters():
+                    p.requires_grad = False
+                for p in layer.mlp.parameters():
+                    p.requires_grad = False
+            else:
+                for p in layer.parameters():
+                    p.requires_grad = True
+    
+    @staticmethod
+    def get_phase(step, val_loss, g_var, ls_var, step_phase2=5000, step_phase3=15000,
+                  val_threshold=3.0, g_var_threshold=0.005):
+        """Determine training phase from metrics."""
+        if step < step_phase2 or val_loss > val_threshold:
+            return 1
+        elif g_var < g_var_threshold or ls_var < 0.02 or step < step_phase3:
+            return 2
+        else:
+            return 3
+    
     def forward(self, h, state=None, global_state=None, pred_weight=None, adaptive=True,
-                context_mem=None, allow_write=None):
+                context_mem=None, allow_write=None, phase=1):
         """h: (B, L, D) — pre-embedded tokens
            state: per-layer memory states from previous forward (or None)
            global_state: cross-layer EMA self-model (or None, created fresh)
            pred_weight: adaptive alpha auxiliary loss weight (or None to compute)
            adaptive: if True, run AdaptiveController (training); if False, skip for speed (inference)
+           phase: 1=base only, 2=base detached+mirror learns, 3=joint fine-tune
         """
         if state is None:
             state = [None] * len(self.layers)
@@ -1280,24 +1333,24 @@ class WideBindStack(nn.Module):
             else AdaptiveController.pred_weight(self.layers,
                 min_val=0.05, max_val=0.3))
                 
-                for i, layer in enumerate(self.layers):
-                    l_expl, l_diff = AdaptiveController.layer_stats(layer,
-                        expl_thresh=self.cfg.exploration_threshold,
-                        diff_thresh=self.cfg.differentiation_threshold)
-                    
-                    b_i_val = AdaptiveController.layer_b_i(layer, expl=l_expl)
-                    b_d_max = getattr(self.cfg, 'vsa_b_d_max', 12.0)
-                    b_d_val = AdaptiveController.layer_b_d(layer, expl=l_expl,
-                        b_d_max=b_d_max)
-                    smooth = getattr(self.cfg, 'vsa_b_d_smooth', 0.999)
-                    if smooth >= 1.0:
-                        layer.b_i.fill_(b_i_val)
-                        layer.b_d.fill_(b_d_val)
-                    else:
-                        b_d_t = torch.tensor(b_d_val, device=layer.b_d.device, dtype=layer.b_d.dtype)
-                        b_i_t = torch.tensor(b_i_val, device=layer.b_i.device, dtype=layer.b_i.dtype)
-                        layer.b_d.data.lerp_(b_d_t, 1.0 - smooth)
-                        layer.b_i.data.lerp_(b_i_t, 1.0 - smooth)
+        for i, layer in enumerate(self.layers):
+            if adaptive:
+                l_expl, l_diff = AdaptiveController.layer_stats(layer,
+                    expl_thresh=self.cfg.exploration_threshold,
+                    diff_thresh=self.cfg.differentiation_threshold)
+                b_i_val = AdaptiveController.layer_b_i(layer, expl=l_expl)
+                b_d_max = getattr(self.cfg, 'vsa_b_d_max', 12.0)
+                b_d_val = AdaptiveController.layer_b_d(layer, expl=l_expl,
+                    b_d_max=b_d_max)
+                smooth = getattr(self.cfg, 'vsa_b_d_smooth', 0.999)
+                if smooth >= 1.0:
+                    layer.b_i.fill_(b_i_val)
+                    layer.b_d.fill_(b_d_val)
+                else:
+                    b_d_t = torch.tensor(b_d_val, device=layer.b_d.device, dtype=layer.b_d.dtype)
+                    b_i_t = torch.tensor(b_i_val, device=layer.b_i.device, dtype=layer.b_i.dtype)
+                    layer.b_d.data.lerp_(b_d_t, 1.0 - smooth)
+                    layer.b_i.data.lerp_(b_i_t, 1.0 - smooth)
         
         # Global self-model: running EMA of layer memory centroids
         # Per-layer EMA rates proportional to 1/τ (Proposal V)
@@ -1339,7 +1392,8 @@ class WideBindStack(nn.Module):
                              mem2v_scale=mem2v_scale, diff=l_diff, noise_scale=nscale,
                              tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                              spectral_mod=spectral_mod,
-                             context_mem=context_mem, allow_write=allow_write)
+                             context_mem=context_mem, allow_write=allow_write,
+                             phase=phase)
             if s_out is not None:
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
@@ -1426,17 +1480,17 @@ class WideBindStack(nn.Module):
         if n_reinf > 0:
             reinforce_loss = reinforce_loss / n_reinf
         
-        # Load balancing: encourage uniform expert usage across tokens
-        # CV of per-expert usage = std/mean — lower means all experts used equally
+        # Load balancing: Herfindahl-Hirschman Index (soft competition, tolerates 2-3 experts)
+        # HHI = Σ(p_i)² ∈ [1/G, 1]. Normalized: 0 at uniform, 1 at monopoly.
         balance_loss = 0.0
         n_bal = 0
         for layer in self.layers:
             usage = getattr(layer.mirror, '_cached_gate_usage', None)
             if usage is not None:
                 usage_p = usage / (usage.sum() + 1e-10)
-                ue = -(usage_p * torch.log(usage_p + 1e-10)).sum()
-                logG = math.log(usage.shape[-1])
-                balance_loss = balance_loss + (logG - ue) / logG
+                hhi = (usage_p ** 2).sum()
+                norm = (hhi - 1.0 / usage.shape[-1]) / (1.0 - 1.0 / usage.shape[-1])
+                balance_loss = balance_loss + norm.clamp(min=0)
                 n_bal = n_bal + 1
         if n_bal > 0:
             balance_loss = balance_loss / n_bal
@@ -1529,12 +1583,6 @@ class WideBindStack(nn.Module):
         diversity_weight = getattr(self.cfg, 'diversity_weight', 0.001)
         nuc_weight = getattr(self.cfg, 'nuclear_weight', 1e-5)
         orth_weight = getattr(self.cfg, 'orth_weight', 1e-4)
-        # Mirror diversity: push log_scale variance (sum-of-squares, no /N dilution)
-        div_w = getattr(self.cfg, 'div_weight', 0.0)
-        div_loss = 0.0
-        if div_w > 0:
-            all_ls = torch.cat([layer.mirror.log_scale.reshape(-1) for layer in self.layers])
-            div_loss = -div_w * all_ls.var()
         # Ranking loss: order ls_mean by gate_usage (contrastive, no /N dilution)
         ranking_weight = getattr(self.cfg, 'ranking_weight', 0.0)
         ranking_loss = 0.0
@@ -1568,6 +1616,23 @@ class WideBindStack(nn.Module):
             n_ls = n_ls + 1
         if n_ls > 0:
             log_scale_reg = log_scale_reg / n_ls
+        # Adaptive aux weights: each aux loss targets a fraction of CE magnitude
+        # Ratios follow λ_d hierarchy: ranking:div:balance:reinforce ≈ λ⁻²:λ⁻⁴:λ⁻⁶:λ⁻⁶
+        ce_mag = ce_loss.detach().abs()
+        div_w = getattr(self.cfg, 'div_weight', 0.0)
+        def _adapt_w(raw_loss, target_frac, min_w=1e-6, max_w=0.3):
+            r = raw_loss.detach().abs() if isinstance(raw_loss, torch.Tensor) else abs(raw_loss)
+            return max(min(target_frac * ce_mag / (r + 1e-10), max_w), min_w)
+        ranking_weight_adapt = _adapt_w(ranking_loss, 0.05, max_w=0.3) if ranking_weight > 0 else 0.0
+        balance_weight_adapt = _adapt_w(balance_loss, 0.005, max_w=0.026) if balance_weight > 0 else 0.0
+        # div: raw diversity (positive variance), div_loss_raw = -(inter + 0.5*intra)
+        div_loss_raw = sum(
+            -(layer.mirror.log_scale.var(dim=0).mean() + 0.5 * layer.mirror.log_scale.var(dim=-1).mean())
+            for layer in self.layers
+        ) / max(len(self.layers), 1) if div_w > 0 else 0.0
+        div_weight_adapt = _adapt_w(div_loss_raw, 0.01, max_w=0.087) if div_w > 0 else 0.0
+        div_loss_adapted = div_weight_adapt * div_loss_raw
+
         # Cache individual losses for monitoring (read by train.py)
         self._cached_losses = {
             'ce': ce_loss.item(),
@@ -1575,16 +1640,20 @@ class WideBindStack(nn.Module):
             'gate_l1': gate_l1.item() if isinstance(gate_l1, torch.Tensor) else gate_l1,
             'reinforce': reinforce_loss.item() if isinstance(reinforce_loss, torch.Tensor) else reinforce_loss,
             'balance': balance_loss.item() if isinstance(balance_loss, torch.Tensor) else balance_loss,
-            'div': div_loss.item() if isinstance(div_loss, torch.Tensor) else div_loss,
+            'div': div_loss_raw.item() if isinstance(div_loss_raw, torch.Tensor) else div_loss_raw,
             'ranking': ranking_loss.item() if isinstance(ranking_loss, torch.Tensor) else ranking_loss,
             'signal_ent': signal_entropy.item() if isinstance(signal_entropy, torch.Tensor) else signal_entropy,
             'ls_reg': log_scale_reg.item() if isinstance(log_scale_reg, torch.Tensor) else log_scale_reg,
+            'rw_ranking': ranking_weight_adapt,
+            'rw_div': div_weight_adapt,
+            'rw_balance': balance_weight_adapt,
         }
         return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss \
-            + balance_weight * balance_loss + diversity_weight * diversity_loss \
+            + balance_weight_adapt * balance_loss + diversity_weight * diversity_loss \
             + nuc_weight * nuc_loss + orth_weight * orth_loss \
-            + w_m2v_weight * w_m2v_loss + branch_weight * branch_loss + div_loss \
-            + ranking_weight * ranking_loss \
+            + w_m2v_weight * w_m2v_loss + branch_weight * branch_loss \
+            + div_loss_adapted \
+            + ranking_weight_adapt * ranking_loss \
             - signal_entropy_weight * signal_entropy \
             + log_scale_l2_weight * log_scale_reg
     

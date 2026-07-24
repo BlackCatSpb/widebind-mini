@@ -73,7 +73,7 @@ class WideBandConfig:
 
     gate_l1_weight: float = 0.0001
     reinforce_weight: float = 0.001
-    balance_weight: float = 0.0001
+    balance_weight: float = 0.026  # λ⁻² → HHI-based load balancing (adaptive from here)
     diversity_weight: float = 0.001
     nuclear_weight: float = 1e-5
     orth_weight: float = 1e-4
@@ -93,10 +93,16 @@ class WideBandConfig:
 
     accum_steps: int = 1
     compile: bool = False
-    div_weight: float = 0.001  # expert diversity: var-based push, no /N (0=disabled)
-    ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (0=disabled)
+    div_weight: float = 0.087  # λ⁻⁴ push log_scale variance per-layer
+    ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (adaptive from here, scaled to 5% of CE)
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
     signal_entropy_weight: float = 0.001  # entropy regularization on signal weights (0=disabled)
+
+    # Phase training config
+    phase2_step: int = 5000     # step threshold to enter Phase 2
+    phase3_step: int = 15000    # step threshold to enter Phase 3
+    phase2_val: float = 3.0     # val_loss threshold for Phase 2 (PPL < 20)
+    phase3_g_var: float = 0.005 # gate variance threshold for Phase 3
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
 
     max_steps: int = 300000
