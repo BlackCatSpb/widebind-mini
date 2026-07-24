@@ -1276,9 +1276,9 @@ class WideBindStack(nn.Module):
                 self._expl_ema.mul_(0.998).add_(expl_raw * (1.0 - 0.998))
                 global_expl = self._expl_ema.clamp(0.0, 1.0).item()
                 
-                self._pred_weight = (pred_weight if pred_weight is not None
-                    else AdaptiveController.pred_weight(self.layers,
-                        min_val=0.05, max_val=1.0))
+        self._pred_weight = (pred_weight if pred_weight is not None
+            else AdaptiveController.pred_weight(self.layers,
+                min_val=0.05, max_val=0.3))
                 
                 for i, layer in enumerate(self.layers):
                     l_expl, l_diff = AdaptiveController.layer_stats(layer,
@@ -1972,9 +1972,11 @@ class MirrorLRScheduler:
             gate_var_sum += m._last_gates.var().item()
         return var_sum / n, mag_sum / n, alpha_sum / n, gate_var_sum / n
 
-    def report_train_loss(self, train_loss):
-        """Report training loss for LR damping. Detects sustained increase, reduces LR."""
-        self._train_loss_tracker.append(train_loss)
+    def report_train_loss(self, train_loss, ce_loss=None):
+        """Report training loss for LR damping. Uses CE loss (not total) to avoid
+        pred_loss growth triggering false dampings. Falls back to total loss if CE unavailable."""
+        track = ce_loss if ce_loss is not None else train_loss
+        self._train_loss_tracker.append(track)
         if len(self._train_loss_tracker) > 500:
             self._train_loss_tracker.pop(0)
         if len(self._train_loss_tracker) >= 300:
