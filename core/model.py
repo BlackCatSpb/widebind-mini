@@ -86,7 +86,7 @@ def vsa_prefix_scan(a, b, state=None):
     if a.dim() == 2:
         a = a.unsqueeze(-1).expand(-1, -1, D)
     
-    eps = 1e-10
+    eps = 1e-6
     CHUNK = 32
     out = []
     s = state.clone() if state is not None else None
@@ -163,7 +163,7 @@ class PartitionedEmbedding(nn.Module):
         # codes → sigmoid(M·codes) даёт плотные коэффициенты, каждый бит влияет на все сегменты
         self.embed_mix = nn.Parameter(torch.zeros(self.K, self.K))
         nn.init.orthogonal_(self.embed_mix)
-        self.register_buffer('_mix_scale', torch.tensor(0.1), persistent=False)
+        self.register_buffer('_mix_scale', torch.tensor(2.0), persistent=False)
         
         self.basis = nn.Parameter(torch.randn(self.K, d))
         nn.init.normal_(self.basis, std=0.02)
@@ -994,15 +994,15 @@ class WideBindBlock(nn.Module):
 
         # Cognitive Mirror (32 эксперта, grouped K-space)
         if getattr(cfg, 'mirror_k_staircase', False):
-            # Иерархия k_l: 4/8/16 по третям глубины, d/k_l ∈ {32,16,8}
+            # Иерархия k_l: 8/16/32 по третям глубины, d/k_l ∈ {14,7,3.5}
             n = cfg.n_layers
             l = layer_idx
             if l < n // 3:
-                k = 4
+                k = 8      # L0-L3: широкое K-space, d/k = 14
             elif l < (2 * n) // 3:
-                k = 8
+                k = 16     # L4-L7: среднее K-space, d/k = 7
             else:
-                k = 16
+                k = 32     # L8-L11: узкое K-space, d/k = 3.5
         else:
             k = cfg.mirror_k
         self.mirror = GroupedCognitiveMirror(cfg.D, G=cfg.mlp_groups, k=k,
@@ -1112,7 +1112,7 @@ class WideBindBlock(nn.Module):
         mem_input = h * i_gate  # (B, L, D)
         input_vec = mem_input.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
         
-        eps = 1e-10
+        eps = 1e-6
         CHUNK = 32
         
         # fp32 guard for log-space scan (critical under AMP for long memory)
@@ -1546,7 +1546,7 @@ class WideBindStack(nn.Module):
                     ls_mean = ls.mean(dim=-1)
                     gate_diff = gu.unsqueeze(1) - gu.unsqueeze(0)  # (G, G)
                     ls_diff = ls_mean.unsqueeze(1) - ls_mean.unsqueeze(0)
-                    margin = 0.1
+                    margin = 0.01
                     ranking_loss = ranking_loss + (F.relu(margin - ls_diff) * (gate_diff > 0).float()).sum()
         # Signal balance: entropy regularization on signal weights (encourages uniform use of all signals)
         signal_entropy = 0.0
@@ -1612,9 +1612,9 @@ class WideBindStack(nn.Module):
             mlr = {
                 'embed': lam ** (-2),
                 'mlp': lam ** (-1),
-                'vsa': lam ** (-4),
+                'vsa': lam ** (-2),   # было -4: 0.087x -> 0.296x, не даёт памяти застаиваться
                 'mirror': lam ** (1),
-                'gate': lam ** (2),
+                'gate': lam ** (1),    # было 2: 3.384x -> 1.839x, мягче для стабильности gate
             }
             groups = {
                 'embed':    {'params': [], 'lr': lr * mlr['embed'], 'weight_decay': 0},
@@ -1813,7 +1813,8 @@ class AdaptiveController:
         # softplus⁻¹(x) = log(exp(x)-1), но для численной стабильности:
         # b_i = log(exp(i_target) - 1) ≈ log(i_target) для малых i_target
         b_i_tau = math.log(max(i_target, 1e-6))
-        return b_i_base + b_i_tau
+        b_i = b_i_base + b_i_tau
+        return max(b_i, -4.0)  # floor: i_gate >= softplus(-4.0) ≈ 0.018
 
     @staticmethod
     def layer_w_mem2v_scale(layer, min_val=0.544, max_val=1.0, diff=None):
@@ -2066,7 +2067,7 @@ class MirrorLRScheduler:
             # Magnitude cap: |mirror| above threshold reduces LR (counter-cyclical)
             mag_factor = min(1.0, max(0.2, self.mag_threshold / max(mag, 1e-10)))
 
-            mirror_mult = min(var_mult, alpha_mult, gate_mult) * mag_factor
+            mirror_mult = (var_mult * alpha_mult * gate_mult) ** (1/3) * mag_factor
             mult = max(0.05, min(1.0, mirror_mult))
 
             # Persistent loss damping applied every step

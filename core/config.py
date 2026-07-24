@@ -85,7 +85,7 @@ class WideBandConfig:
     vsa_b_lr_mult: float = 0.1
 
     # BottleneckBind twist: inter-channel bilinear mixing via golden-angle shifts
-    bind_twist_mode: str = "off"         # "off" | "shift" | "cascade"
+    bind_twist_mode: str = "shift"        # "off" | "shift" | "cascade"
     bind_twist_S: int = 4                # number of shifts (overridden to 1 when mode=off)
     bind_twist_ocular: str = "tied"      # "tied" | "multi" — per-shift W_out
     bind_twist_scheme: str = "golden"    # "golden" | "fibonacci"
@@ -94,7 +94,7 @@ class WideBandConfig:
     accum_steps: int = 1
     compile: bool = False
     div_weight: float = 0.0001  # expert diversity: var-based push, no /N (0=disabled)
-    ranking_weight: float = 0.1  # pairwise order ls_mean by gate_usage (0=disabled)
+    ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (0=disabled)
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
     signal_entropy_weight: float = 0.001  # entropy regularization on signal weights (0=disabled)
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
