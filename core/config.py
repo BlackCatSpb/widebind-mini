@@ -98,11 +98,6 @@ class WideBandConfig:
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
     signal_entropy_weight: float = 0.001  # entropy regularization on signal weights (0=disabled)
 
-    # Phase training config
-    phase2_step: int = 5000     # step threshold to enter Phase 2
-    phase3_step: int = 15000    # step threshold to enter Phase 3
-    phase2_val: float = 3.0     # val_loss threshold for Phase 2 (PPL < 20)
-    phase3_g_var: float = 0.005 # gate variance threshold for Phase 3
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
 
     max_steps: int = 300000

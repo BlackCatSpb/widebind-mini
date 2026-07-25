@@ -98,6 +98,10 @@ def train(cfg, data_dir, device):
     if device == 'cuda':
         print(f'  VRAM used: {torch.cuda.memory_allocated()/1e9:.2f} GB')
 
+    # Phase tracking state (EMA-based adaptive threshold)
+    model._phase_ratio_ema = [0.0] * cfg.n_layers
+    model._phase_ratio_std = [1.0] * cfg.n_layers
+
     # Data
     streams, total_tokens = load_streams(data_dir)
 
@@ -186,16 +190,86 @@ def train(cfg, data_dir, device):
 
             # Forward (pure FP32, no autocast)
             h = model.embed_tokens(x)
-            out, state, gs = model(h, state, global_state=gs)
-            loss = model.compute_loss(out, y) / accum
+            out, state, gs = model(h, state, global_state=gs, step=step)
+
+            # Compute losses (raw, unweighted)
+            ce_loss, aux_dict = model.compute_losses(out, y)
 
             # NaN guard
-            if torch.isnan(loss) or torch.isinf(loss):
-                raise RuntimeError(f'NaN/Inf loss at step {step}')
+            if torch.isnan(ce_loss) or torch.isinf(ce_loss):
+                raise RuntimeError(f'NaN/Inf CE loss at step {step}')
 
             state = detach(state)
             gs = detach(gs)
-            loss.backward()
+
+            # CE gradients (retain graph for aux backward)
+            ce_grads = torch.autograd.grad(ce_loss / accum, model.parameters(),
+                                           retain_graph=bool(aux_dict), allow_unused=True)
+
+            # Spectral gradient alignment: scale aux by cos(g_CE, g_aux)
+            if aux_dict:
+                aux_total = sum(
+                    v for v in aux_dict.values()
+                    if isinstance(v, torch.Tensor) and v.requires_grad
+                ) / accum
+                aux_grads = torch.autograd.grad(aux_total, model.parameters(), allow_unused=True)
+                # Flatten shared subspace (params where BOTH grads exist)
+                ce_list, aux_list = [], []
+                for gce, gaux in zip(ce_grads, aux_grads):
+                    if gce is not None and gaux is not None:
+                        ce_list.append(gce.flatten())
+                        aux_list.append(gaux.flatten())
+                if ce_list:
+                    ce_flat = torch.cat(ce_list)
+                    aux_flat = torch.cat(aux_list)
+                    cos_sim = F.cosine_similarity(ce_flat.unsqueeze(0), aux_flat.unsqueeze(0))
+                    scale = max(0, cos_sim.item()) * ce_flat.norm() / (aux_flat.norm() + 1e-8)
+                else:
+                    scale = 0.0
+            else:
+                scale = 0.0
+
+            # Combine: g = g_CE + scale * g_aux (scale > 0 only when aux aligns with CE)
+            with torch.no_grad():
+                for p, cg in zip(model.parameters(), ce_grads):
+                    if cg is not None:
+                        p.grad = cg.clone()
+                    else:
+                        p.grad = None
+                if aux_dict and scale > 0:
+                    for p, ag in zip(model.parameters(), aux_grads):
+                        if p.grad is not None and ag is not None:
+                            p.grad.add_(ag, alpha=scale)
+                        elif ag is not None:
+                            p.grad = ag * scale
+            
+            # Adaptive phase scaling: EMA-based mirror/base gradient balance
+            # mirror_scale = sigmoid((ratio - ratio_ema) / (ratio_std + 1e-8))
+            # When ratio exceeds EMA by >1 std, mirror is growing → sigmoid > 0.5 → boost
+            phase_scales = []
+            for i, layer in enumerate(model.layers):
+                mirror_norm = 0.0
+                base_norm = 0.0
+                for p in layer.mirror_parameters:
+                    if p.grad is not None:
+                        mirror_norm += p.grad.norm().item() ** 2
+                for p in layer.base_parameters:
+                    if p.grad is not None:
+                        base_norm += p.grad.norm().item() ** 2
+                mirror_norm = mirror_norm ** 0.5
+                base_norm = base_norm ** 0.5
+                ratio = mirror_norm / (base_norm + 1e-8)
+                ema = model._phase_ratio_ema[i]
+                std = model._phase_ratio_std[i]
+                model._phase_ratio_ema[i] = 0.99 * ema + 0.01 * ratio
+                model._phase_ratio_std[i] = 0.99 * std + 0.01 * abs(ratio - ema)
+                mir_s = 1.0 / (1.0 + math.exp(-(ratio - ema) / (std + 1e-8)))
+                phase_scales.append((mir_s, ratio))
+                for p in layer.mirror_parameters:
+                    if p.grad is not None:
+                        p.grad *= mir_s
+            mean_mirror_scale = sum(s[0] for s in phase_scales) / len(phase_scales)
+            mean_ratio = sum(s[1] for s in phase_scales) / len(phase_scales)
             tokens += cfg.batch_size * cfg.seq_len
 
             if (step + 1) % accum == 0:
@@ -217,8 +291,9 @@ def train(cfg, data_dir, device):
                 # Individual aux losses from compute_loss cache
                 lc = getattr(model, '_cached_losses', {})
                 aux_str = ' '.join(f'{k}={v:.4f}' for k, v in lc.items())
-                print(f'step={step:>6} loss={loss.item()*accum:.4f} |1-a|={idiff:.4f} '
+                print(f'step={step:>6} loss={ce_loss.item():.4f} |1-a|={idiff:.4f} '
                       f'g_var={gvar:.4f} ls_var={ls_var:.4f} lr={lr:.2e} tok/s={tokens/dt:.0f} '
+                      f'ms={mean_mirror_scale:.3f} mr={mean_ratio:.4f} '
                       f'mem={mem_gb:.2f}GB | {aux_str}')
                 if device == 'cuda':
                     torch.cuda.reset_peak_memory_stats()
