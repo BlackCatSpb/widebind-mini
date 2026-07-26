@@ -73,7 +73,7 @@ class WideBandConfig:
 
     gate_l1_weight: float = 0.0001
     reinforce_weight: float = 0.001
-    balance_weight: float = 0.026  # λ⁻² → HHI-based load balancing (adaptive from here)
+    balance_weight: float = 0.026  # λ⁻⁶ → HHI-based load balancing (adaptive from here)
     diversity_weight: float = 0.001
     nuclear_weight: float = 1e-5
     orth_weight: float = 1e-4
@@ -96,7 +96,6 @@ class WideBandConfig:
     div_weight: float = 0.087  # λ⁻⁴ push log_scale variance per-layer
     ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (adaptive from here, scaled to 5% of CE)
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
-    signal_entropy_weight: float = 0.001  # entropy regularization on signal weights (0=disabled)
 
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
 
