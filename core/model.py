@@ -1313,6 +1313,14 @@ class WideBindStack(nn.Module):
             state = [None] * len(self.layers)
         B, L, D = h.shape
         
+        # ─── Learnable VSA scales (Idea 1) — moved before AdaptiveController loop ───
+        vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
+        tau_min = vsa_tau[0]
+        tau_max = vsa_tau[-1]
+        tau_mid = (tau_min * tau_max).sqrt()
+        c_ema = (1.0 / math.sqrt(self.cfg.D)) * tau_mid
+        n_layers = len(self.layers)
+        
         # ─── Adaptive gate biases from mirror stats (per-layer) ───
         if adaptive:
             with torch.no_grad():
@@ -1350,20 +1358,12 @@ class WideBindStack(nn.Module):
         
         # Global self-model: running EMA of layer memory centroids
         # Per-layer EMA rates proportional to 1/τ (Proposal V)
-        n_layers = len(self.layers)
         if global_state is None:
             global_state = torch.zeros(n_layers, 1, D, device=h.device, dtype=h.dtype)
         if global_state.dim() == 2:
             global_state = global_state.unsqueeze(0).expand(n_layers, -1, -1).clone()
         elif global_state.shape[0] != n_layers:
             global_state = global_state[0:1].expand(n_layers, -1, -1).clone()
-        # ─── Learnable VSA scales (Idea 1) ───
-        vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
-        # vmin/vmid/vmax for per-layer tau_l and c_ema (dynamic from current τ)
-        tau_min = vsa_tau[0]
-        tau_max = vsa_tau[-1]
-        tau_mid = (tau_min * tau_max).sqrt()
-        c_ema = (1.0 / math.sqrt(self.cfg.D)) * tau_mid
         # ─── Momentum warmup for global_state oscillation (Idea 3) ───
         momentum_beta = 0.0
         if adaptive and step is not None and step >= 5000:
