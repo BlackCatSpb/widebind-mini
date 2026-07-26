@@ -600,14 +600,17 @@ class GroupedCognitiveMirror(nn.Module):
             s_norm = s / (self._signal_norm_ema[i].unsqueeze(0).unsqueeze(0) + 1e-8)
             signals_normed.append(s_norm)
         
-        # ─── Decorrelation: orthogonalize signals (standing wave modes) ───
+        # ─── Learnable signal weights (softmax-normalized) — moved before decorr ───
+        w = torch.softmax(self._signal_log_weights, dim=0)  # {n_sig} weights summing to 1
+        
+        # ─── Decorrelation: orthogonalize WEIGHTED signals (gradient flows to _signal_log_weights) ───
         n_sig = len(signals)
         decorr = 0.0
         npairs = 0
         for i in range(n_sig):
             for j in range(i + 1, n_sig):
-                si = signals_normed[i].reshape(-1, signals_normed[i].shape[-2] * signals_normed[i].shape[-1])
-                sj = signals_normed[j].reshape(-1, signals_normed[j].shape[-2] * signals_normed[j].shape[-1])
+                si = (signals_normed[i] * w[i]).reshape(-1, signals_normed[i].shape[-2] * signals_normed[i].shape[-1])
+                sj = (signals_normed[j] * w[j]).reshape(-1, signals_normed[j].shape[-2] * signals_normed[j].shape[-1])
                 si_c = si - si.mean(dim=0, keepdim=True)
                 sj_c = sj - sj.mean(dim=0, keepdim=True)
                 cos_ij = (si_c * sj_c).sum(dim=-1) / (si_c.norm(dim=-1) * sj_c.norm(dim=-1) + 1e-8)
@@ -616,10 +619,6 @@ class GroupedCognitiveMirror(nn.Module):
         if npairs > 0:
             decorr = decorr / npairs
         self._cached_decorr = decorr
-        
-        # ─── Learnable signal weights (softmax-normalized) ───
-        n_sig = len(signals)
-        w = torch.softmax(self._signal_log_weights, dim=0)  # {n_sig} weights summing to 1
         
         # ─── Merge all signals (weighted sum) ───
         delta = sum(w[i] * signals_normed[i] for i in range(n_sig))
@@ -1728,7 +1727,7 @@ class WideBindStack(nn.Module):
                 'default_wd':{'params': [], 'lr': lr,               'weight_decay': wd},
             }
             for name, p in self.named_parameters():
-                if '.b_d' in name or '.b_i' in name:
+                if '.b_d' in name or '.b_i' in name or '.scale_w' in name:
                     groups['vsa']['params'].append(p)
                 elif name.startswith('embed.') or name.startswith('lm_head.readout') or name.startswith('lm_head.proj'):
                     k = 'embed_wd' if p.ndim >= 2 else 'embed'
@@ -1764,7 +1763,7 @@ class WideBindStack(nn.Module):
         gate_no_decay = []
         vsa_bias = []
         for name, p in self.named_parameters():
-            if '.b_d' in name or '.b_i' in name:
+            if '.b_d' in name or '.b_i' in name or '.scale_w' in name:
                 vsa_bias.append(p)
                 continue
             is_gate = any(g in name for g in ['.w_i', '.w_d', '.w_q', '.w_q_leaf', '.w_q_ctx', '.w_mem2v',
