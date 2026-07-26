@@ -227,7 +227,7 @@ VSA gates (per layer):
 1. Проецирует h_g (d=112) → hp_g (k=32) через W_proj (d×k)
 2. Вычисляет 5 сигналов коррекции в K-space
 3. EMA-нормирует сигналы (соизмеримость)
-4. Смешивает через learnable softmax-веса (5 весов, sum=1)
+4. Смешивает через learnable sigmoid + Fibonacci init (5 весов, без sum-to-1)
 5. Собирает delta = Σ w_i · signal_i
 6. Проецирует delta обратно: delta @ W_out (k→d)
 7. Вычисляет per-expert gate = sigmoid(Σ сигналов)
@@ -267,15 +267,23 @@ s_norm = s / (ema[i] + 1e-8)
 
 Текущий RMS каждого сигнала экспоненциально сглаживается (τ ≈ 1000 шагов).
 
-### 5.4 Learnable signal weights
+### 5.4 Learnable signal weights (sigmoid + Fibonacci)
 
 ```python
-w = softmax(signal_log_weights)  # 5 weights, sum=1
+w = sigmoid(signal_log_weights)  # 5 weights, no sum-to-1 constraint
 delta = Σ w[i] · signals_normed[i]
 ```
 
-Энтропийная регуляризация: +0.001 · H(w) в loss (поощрение равномерного
-использования всех 5 сигналов, предотвращает доминирование одного).
+Инициализация Фибоначчи [1,1,2,3,5]: `bias = log(p/(1-p))`, где `p = Fib/sum(Fib)`.
+Медленные сигналы (help_k, sym_k) получают больший init вес и больший градиент
+(производная sigmoid ∝ w·(1-w), максимальна при w=0.5, при w=0.417 ≈ 0.243 vs
+0.076 при w=0.083).
+
+Jacobian sigmoid диагональный, полного ранга — каждый вес получает независимый
+градиент, нет перекрёстного влияния через sum-to-1, как в softmax.
+
+Энтропийная регуляризация: +0.001 · H(p) в loss, где p = w / sum(w) — нормализация
+для энтропии (sigmoid не гарантирует sum=1).
 
 ### 5.5 K-Space gate
 
@@ -458,12 +466,16 @@ help_k добавляется к 4 базовым сигналам (temp, pred_e
 
 ```python
 signals = [temp_k, pred_error, smooth_k, sym_k, help_k]  # 5 сигналов
-w = softmax(signal_log_weights)
+w = sigmoid(signal_log_weights)  # Fibonacci init [1,1,2,3,5]
 delta = Σ w[i] · signals_normed[i]
 ```
 
-Энтропийная регуляризация сигналов: -0.001 · H(w) в loss.
-Поощряет равномерное использование всех 5 сигналов.
+Энтропийная регуляризация сигналов: -0.001 · H(p) в loss, где p = w / sum(w).
+Поощряет равномерное использование всех 5 сигналов (через нормализованную
+энтропию, т.к. sigmoid не гарантирует sum=1).
+
+Decorrelation loss считается на взвешенных сигналах `w[i]·s_normed[i]` —
+прямой градиент в `signal_log_weights`, не размытый через 12 слоёв.
 
 ---
 
@@ -696,7 +708,7 @@ LR растёт с var(log_scale), |1-α|, gate_var.
 | reinforce | 0.01 | Gate должен совпадать с usefulness |
 | balance | 0.01 | Load balancing (энтропия использования) |
 | diversity | 0.001 | var(log_scale) — специализация |
-| signal_entropy | 0.001 | H(omega) — равномерность сигналов |
+| signal_entropy | 0.001 | H(p) — равномерность sigmoid-весов, p = w / sum(w) |
 | nuclear | 1e-5 | Ядерная норма W_proj |
 | orth | 1e-4 | Ортогональность W_proj |
 
@@ -760,7 +772,10 @@ help_k не работал первые шаги.
 
 ### 12.7 Signal imbalance
 help_k мог доминировать над остальными 4 сигналами (temp/pred/smooth/sym).
-**Fix**: энтропийная регуляризация -H(omega) с весом 0.001.
+**Upgrade (July 2026)**: softmax → sigmoid + Fibonacci init [1,1,2,3,5].
+Медленные сигналы (help_k, sym_k) получают больший init weight и градиент.
+Диагональный Jacobian sigmoid устраняет сингулярность softmax. Decorrelation на
+взвешенных сигналах — прямой градиент в веса.
 
 ### 12.8 Shift mode rank limitation
 При tie_bind=True в режиме shift все S слагаемых проецировались через

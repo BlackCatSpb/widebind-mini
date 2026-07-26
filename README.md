@@ -53,11 +53,13 @@ h → RMSNorm → Conv1d(groups=D, k=48) → BottleneckBind(D→K=32→D) → VS
 ### 2.2 VSA Memory — мультимасштабная векторная суперпозиция
 
 Векторная суперпозиция с chunked prefix scan (CHUNK=32), 4 фиксированных масштаба
-τ = [8, 32, 128, 512] с softmax-комбинацией (`scale_w` ∈ ℝ^{4×D}).
+τ = [8, 32, 128, 512] с sigmoid-комбинацией (`scale_w` ∈ ℝ^{4×D}).
 
 Каждый масштаб τ_s имеет свой prefix scan, результат — взвешенная сумма через
-softmax по `scale_w`. Это даёт model 4 временных горизонта: короткий (τ=8),
-средний (τ=32), длинный (τ=128), очень длинный (τ=512).
+sigmoid по `scale_w` (без sum-to-1, полный ранг Jacobian). Это даёт модели 4
+временных горизонта: короткий (τ=8), средний (τ=32), длинный (τ=128),
+очень длинный (τ=512). Инициализация — иерархия Фибоначчи [1,1,2,3] → sigmoid
+[0.143, 0.143, 0.286, 0.429]: медленные шкалы получают больший вес и градиент.
 
 surprisal-gated i_gate, dual readout + first moment. fp32 guard для численной стабильности.
 
@@ -94,8 +96,9 @@ write gate, read gate, decay, memory-to-value scale, noise.
 
 1. Проецирует `h` в K-space (k = 8/16/32 staircase): `hp = h_reshape @ W_proj[g]`
 2. Вычисляет 4 базовых сигнала коррекции + help_k (private memory)
-3. EMA-нормирует сигналы (соизмеримость перед softmax)
-4. Смешивает через learnable softmax-веса
+3. EMA-нормирует сигналы
+4. Смешивает через learnable sigmoid-веса + Fibonacci init (диагональный Jacobian,
+   полный ранг, независимые градиенты)
 5. Проецирует delta из K-space в D-space через W_out
 6. Вычисляет per-expert gate: sigmoid(|pred_err| + |delta| + grad_mod + dvar_mod + contradiction)
 7. Модулирует MLP и VSA memory через usefulness
@@ -141,7 +144,9 @@ trust = 1 - contra                   # доверие к коллективу
 help_k = help_k_base * sigmoid(w_help) * trust
 ```
 
-help_k — 5-й сигнал, со своим learnable весом в softmax-нормировке сигналов.
+help_k — 5-й сигнал, со своим learnable sigmoid-весом + Fibonacci init [1,1,2,3,5].
+Deccorelation loss считается на взвешенных сигналах `w[i]·s_normed[i]` — прямой
+градиент в веса, не размытый через 12 слоёв.
 
 #### Детекция противоречий (EVA-inspired, в K-space)
 
@@ -237,7 +242,7 @@ python train.py --data-dir ./wb --accum 8 --private-mem --div-weight 0.005
 | `--private-mem` | — | Включить мета-познание (private memory, contradiction, concept graph) |
 | `--div-weight` | 0.0001 | Вес diversity loss (var(log_scale) bonus) |
 | `--ranking-weight` | 0.1 | Pairwise порядок ls_mean по gate_usage |
-| `--signal-entropy-weight` | 0.001 | Энтропийная регуляризация весов сигналов |
+| ~~`--signal-entropy-weight`~~ | — | Удалён (энтропия считается на sigmoid p = w/sum(w), вес вшит в balance_loss) |
 | `--log-scale-l2-weight` | 0.01 | L2 на exp(log_scale) > 10 |
 | `--mirror-k-staircase` | True | Иерархия K-space по глубине (8/16/32) |
 | `--lambda-lr-hierarchy` | True | λ_d LR иерархия (0.29×...3.38×) |
@@ -277,7 +282,8 @@ python train.py --data-dir ./wb --accum 8 --private-mem --div-weight 0.005
 | balance | 0.001 | Баланс использования экспертов (load balancing) |
 | diversity (var) | 0.0001 | Дисперсия log_scale (специализация) — `.var()` а не `.sum()` |
 | ranking | 0.01 | Pairwise: ls_mean_i > ls_mean_j если gate_usage_i > gate_usage_j (margin=0.01) |
-| signal_entropy | 0.001 | −H(ω) — равномерное использование 5 сигналов коррекции |
+| signal_entropy | 0.001 | −H(p) — равномерность sigmoid-весов, p = w / sum(w) |
+| decorr (weighted) | — | Взвешенная ортогонализация `w[i]·s_i` — прямой градиент в веса |
 | log_scale_l2 | 0.01 | L2 на exp(log_scale) > 10 (защита от gradient explosion) |
 | nuclear / orth | 1e-5 / 1e-4 | Регуляризация W_proj |
 
@@ -330,6 +336,10 @@ Net: help_k ≈ 12% от help_k_base. Gradient до w_help идёт через 5
 ### 5.7 Signal imbalance
 help_k мог доминировать над остальными 4 сигналами (temp/pred/smooth/sym).
 **Fix**: энтропийная регуляризация `-H(omega)` с весом 0.001 — поощрение равномерного использования всех сигналов.
+**Upgrade (July 2026)**: softmax → sigmoid + Fibonacci init [1,1,2,3,5]. Медленные
+сигналы (help_k, sym_k) получают больший init weight и градиент. Диагональный Jacobian
+sigmoid устраняет сингулярность softmax и перекрёстное влияние весов. Decorrelation loss
+считается на взвешенных сигналах — прямой градиент в веса.
 
 ### 5.8 Shift mode rank limitation
 При `tie_bind=True` в режиме `shift` все S слагаемых проецировались через один W_out = W_proj^T,
@@ -344,7 +354,8 @@ d/k на ранних слоях — 14 (было 28), достаточно дл
 ### 5.10 Per-channel VSA τ overflow
 Per-channel b_d могло уходить в экстремумы (τ → 163K), вызывая numerical overflow
 в prefix scan. **Fix**: multi-scale VSA с 4 фиксированными τ = [8, 32, 128, 512],
-комбинируемыми через per-channel softmax (`scale_w` ∈ ℝ^{4×D}).
+комбинируемыми через per-channel sigmoid (`scale_w` ∈ ℝ^{4×D}) + Fibonacci init.
+Weight decay исключён для scale_w (группа vsa, wd=0) — не толкает к равномерности.
 
 ### 5.11 LR death — замирание обучения
 Единый LR для всех компонентов приводил к замиранию: gates не успевали за mirror,
@@ -417,6 +428,12 @@ tok/s: ~56 (MX550, L=512).
 
 | Изменение | Описание |
 |-----------|----------|
+| **Signal weights: softmax→sigmoid+Fib** | `_signal_log_weights`: sigmoid + Fibonacci [1,1,2,3,5]. Диагональный Jacobian, полный ранг, независимые градиенты. Медленные сигналы (help_k, sym_k) получают больший init вес. |
+| **scale_w: softmax→sigmoid+Fib** | 4 масштаба VSA: sigmoid + Fib [1,1,2,3]. Без sum-to-1, weight_decay=0 (группа vsa). Не толкает к равномерности. |
+| **Decorrelaton на взвешенных сигналах** | `decorr_loss` = Σ⟨w[i]·s_normed[i], w[j]·s_normed[j]⟩. Прямой градиент в `_signal_log_weights`, не размытый через 12 слоёв. |
+| **fib_sigmoid_init()** | Хелпер: bias = log(p/(1-p)) из ряда Фибоначчи. Используется для `_signal_log_weights` и `scale_w`. |
+| **signal_entropy для sigmoid** | `p = w / sum(w)`, затем `-Σp·lg(p)`. Адаптирована под снятие sum-to-1. |
+| **VSA-aware tau_l + layer_b_i()** | `layer_b_i()` принимает `tau_l`, использует реальную VSA tau когда передана. VSA_tau вынесено до первого цикла (чинит `UnboundLocalError`). Порог tau -4.0 → -6.0. |
 | **bind_twist_mode default** | `"off"` → `"shift"` — Fibonacci-twist включён по умолчанию |
 | **Staircase k fix** | [4, 8, 16] → [8, 16, 32] — устранён bottleneck на ранних слоях |
 | **Embed sparsity fix** | `_mix_scale=0.1` → `2.0` — sigmoid активирует только активные коды (0.99 vs 0.50) |
@@ -442,12 +459,14 @@ tok/s: ~56 (MX550, L=512).
 | balance | 0.001 | Load balancing (энтропия использования → logG) |
 | div (var(log_scale)) | 0.0001 | Специализация mirror (отрицательный loss, push variance) |
 | ranking | 0.1 | Сортировка log_scale по gate_usage |
-| signal_entropy | 0.001 | −H(ω) — равномерность сигналов |
+| signal_entropy | 0.001 | −H(p) — равномерность sigmoid-весов, p = w / sum(w) |
+| decorr (weighted) | — | Взвешенная ортогонализация `w[i]·s_i` — прямой градиент в веса |
 | log_scale_l2 | 0.01 | L2 на exp(log_scale) > 10 |
 
 ### Следующие шаги
 
-1. Полноценный запуск на T4 (Colab) с `--private-mem` и staircase k
-2. Мониторинг contra_expert, trust_matrix, scale_w через debug_mind()
-3. Мониторинг scale_w (softmax multi-scale VSA) — равномерность 4 масштабов
-4. Перенос проверенных архитектурных улучшений в полную WideBind (D=4096)
+1. Мониторинг sigmoid(scale_w): дрейф суммы, std, энтропия — первые 2000 шагов
+2. Мониторинг sigmoid(_signal_log_weights): отклонение от Fibonacci init, специализация
+3. Полноценный запуск на T4 (Colab) с `--private-mem` и staircase k
+4. Мониторинг contra_expert, trust_matrix, scale_w через debug_mind()
+5. Перенос проверенных архитектурных улучшений в полную WideBind (D=4096)
