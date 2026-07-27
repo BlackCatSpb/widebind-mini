@@ -97,9 +97,17 @@ class WideBindBlock(nn.Module):
 
         device = h.device
         if hasattr(self.mirror, '_cached_pred_error_norm') and self.mirror._cached_pred_error_norm is not None:
-            self.mirror._cached_pred_error_norm = self.mirror._cached_pred_error_norm.detach().to(device)
+            pen = self.mirror._cached_pred_error_norm
+            if pen.shape[-1] != L:
+                self.mirror._cached_pred_error_norm = None
+            else:
+                self.mirror._cached_pred_error_norm = pen.detach().to(device)
         if hasattr(self.mirror, '_cached_hp') and self.mirror._cached_hp is not None:
-            self.mirror._cached_hp = self.mirror._cached_hp.detach().to(device)
+            hp = self.mirror._cached_hp
+            if hp.shape[1] != L:
+                self.mirror._cached_hp = None
+            else:
+                self.mirror._cached_hp = hp.detach().to(device)
 
         h = F.rms_norm(h, (D,), self.pre_ln_w)
 
