@@ -115,7 +115,7 @@ def vsa_prefix_scan(a, b, state=None):
         log_a_chunk = torch.log(a_chunk.clamp(min=eps))
         log_cum_chunk = torch.cumsum(log_a_chunk, dim=1)
         cum_decay_chunk = torch.exp(log_cum_chunk)
-        inv_cum_decay_chunk = 1.0 / cum_decay_chunk.clamp(min=eps)
+        inv_cum_decay_chunk = (1.0 / cum_decay_chunk.clamp(min=eps)).clamp(max=1e6)
         
         weighted = b_chunk * inv_cum_decay_chunk
         cum_weighted = torch.cumsum(weighted, dim=1)
@@ -1117,7 +1117,7 @@ class WideBindBlock(nn.Module):
         h_conv = h_conv[..., :L].transpose(1, 2)
         conv_state_out = h_perm[:, :, -(self.conv.padding[0]):]
         h = h + h_conv
-        self._cache_conv_out = h_conv.detach()
+        self._cache_conv_out = h_conv  # для branch_loss (с градиентом)
         
         # ─── Bind: BottleneckBind ───
         bind_out = self.bind(h)
@@ -1166,7 +1166,7 @@ class WideBindBlock(nn.Module):
             log_a = torch.log(d_chunk.clamp(min=eps))
             log_cum = torch.cumsum(log_a, dim=1)
             cum_decay = torch.exp(log_cum)
-            inv_cum = 1.0 / cum_decay.clamp(min=eps)
+            inv_cum = (1.0 / cum_decay.clamp(min=eps)).clamp(max=1e6)
             weighted = b_chunk * inv_cum
             cum_w = torch.cumsum(weighted, dim=1)
             intra = cum_decay * cum_w
@@ -1251,8 +1251,8 @@ class WideBindBlock(nn.Module):
         mem_modulated = (mem_read.reshape(B, L, g, d) * mm).reshape(B, L, D)
         enhanced_base = bind_out + mem_modulated * self.w_mem2v * mem2v_scale
         enhanced = enhanced_base + mirror
-        self._cache_bind_out = enhanced_base.detach()
-        self._cache_mirror_out = mirror.detach()
+        self._cache_bind_out = enhanced_base  # для branch_loss (с градиентом)
+        self._cache_mirror_out = mirror  # для branch_loss (с градиентом)
         h = h + enhanced
         
         # ─── Spectral (adaptive: diff modulates frequency shaping) ───
@@ -1545,13 +1545,16 @@ class WideBindStack(nn.Module):
         nuc_loss = 0.0
         n_nuc = 0
         for layer in self.layers:
-            W = getattr(layer, 'W_proj', None)
-            if W is not None:
-                rank_ub = min(W.shape[0], W.shape[1])
+            # BottleneckBind W_proj (D→K weight matrix)
+            bind_W = None
+            if hasattr(layer, 'bind') and hasattr(layer.bind, 'W_proj'):
+                bind_W = layer.bind.W_proj.weight
+            if bind_W is not None and bind_W.ndim == 2:
+                rank_ub = min(bind_W.shape[0], bind_W.shape[1])
                 nuc_iters = max(1, int(math.sqrt(rank_ub)))
-                v = torch.randn(W.shape[1], nuc_iters, device=W.device)
-                Wv = W @ v
-                nuc = Wv.norm(dim=0).mean() * math.sqrt(W.shape[1])
+                v = torch.randn(bind_W.shape[1], nuc_iters, device=bind_W.device)
+                Wv = bind_W @ v
+                nuc = Wv.norm(dim=0).mean() * math.sqrt(bind_W.shape[1])
                 nuc_loss = nuc_loss + nuc
                 n_nuc = n_nuc + 1
         if n_nuc > 0:
@@ -1560,9 +1563,11 @@ class WideBindStack(nn.Module):
         orth_loss = 0.0
         n_orth = 0
         for layer in self.layers:
-            W = getattr(layer, 'W_proj', None)
-            if W is not None:
-                W_hat = W / W.norm(dim=0, keepdim=True).clamp(min=1e-8)
+            bind_W = None
+            if hasattr(layer, 'bind') and hasattr(layer.bind, 'W_proj'):
+                bind_W = layer.bind.W_proj.weight
+            if bind_W is not None and bind_W.ndim == 2:
+                W_hat = bind_W / bind_W.norm(dim=0, keepdim=True).clamp(min=1e-8)
                 gram = W_hat.T @ W_hat
                 orth = F.mse_loss(gram, torch.eye(gram.shape[0], device=gram.device))
                 orth_loss = orth_loss + orth
@@ -1750,8 +1755,17 @@ class WideBindStack(nn.Module):
                 elif name.startswith('embed.') or name.startswith('lm_head.readout') or name.startswith('lm_head.proj'):
                     k = 'embed_wd' if p.ndim >= 2 else 'embed'
                     groups[k]['params'].append(p)
-                elif '.mlp.' in name or name.endswith('.W_proj') or name.endswith('.W_out'):
-                    # Block-level W_proj/W_out (not mirror) → mlp speed
+                elif any(g in name for g in ['.mirror.alpha_diag', '.mirror.w_pred_scale_legacy',
+                                              '.log_skip_alpha', '.mirror.W_proj', '.mirror.W_out',
+                                              '.mirror.w_temp', '.mirror.w_global',
+                                              '.mirror.log_scale', '.mirror.tanh_bias',
+                                              '.log_dvar_mod_scale', '.dvar_mod_bias',
+                                              '.log_grad_mod_scale', '.grad_mod_bias']):
+                    # Mirror projections, alpha, gates -> mirror LR (1.84x)
+                    k = 'mirror_wd' if p.ndim >= 2 else 'mirror'
+                    groups[k]['params'].append(p)
+                elif '.mlp.' in name or '.bind.W_proj.weight' in name or name.endswith('.W_out') or name.endswith('.W_proj'):
+                    # Block-level W_proj/W_out (not mirror, caught above) -> mlp speed (0.54x)
                     k = 'mlp_wd' if p.ndim >= 2 else 'mlp'
                     groups[k]['params'].append(p)
                 elif any(g in name for g in ['.w_gate', '.b_gate', '.w_delta_gate', '.b_delta_gate',
@@ -1759,14 +1773,6 @@ class WideBindStack(nn.Module):
                                               '.w_k_mu', '.w_q_mu', '.w_mu_mem',
                                               '.w_u', '.w_v']):
                     k = 'gate_wd' if p.ndim >= 2 else 'gate'
-                    groups[k]['params'].append(p)
-                elif any(g in name for g in ['.mirror.alpha_diag', '.mirror.w_pred_scale_legacy',
-                                              '.log_skip_alpha', '.mirror.W_proj', '.mirror.W_out',
-                                              '.mirror.w_temp', '.mirror.w_global',
-                                              '.mirror.log_scale', '.mirror.tanh_bias',
-                                              '.log_dvar_mod_scale', '.dvar_mod_bias',
-                                              '.log_grad_mod_scale', '.grad_mod_bias']):
-                    k = 'mirror_wd' if p.ndim >= 2 else 'mirror'
                     groups[k]['params'].append(p)
                 else:
                     k = 'default_wd' if p.ndim >= 2 else 'default'

@@ -223,7 +223,7 @@ def train(cfg, data_dir, device):
                     ce_flat = torch.cat(ce_list)
                     aux_flat = torch.cat(aux_list)
                     cos_sim = F.cosine_similarity(ce_flat.unsqueeze(0), aux_flat.unsqueeze(0))
-                    scale = max(0, cos_sim.item()) * ce_flat.norm() / (aux_flat.norm() + 1e-8)
+                    scale = max(0, min(10.0, cos_sim.item())) * ce_flat.norm() / (aux_flat.norm() + 1e-8)
                 else:
                     scale = 0.0
             else:
@@ -263,7 +263,7 @@ def train(cfg, data_dir, device):
                 std = model._phase_ratio_std[i]
                 model._phase_ratio_ema[i] = 0.99 * ema + 0.01 * ratio
                 model._phase_ratio_std[i] = 0.99 * std + 0.01 * abs(ratio - ema)
-                mir_s = 1.0 / (1.0 + math.exp(-(ratio - ema) / (std + 1e-8)))
+                mir_s = max(0.2, min(2.0, 1.0 / (1.0 + math.exp(-(ratio - ema) / (std + 1e-8)))))
                 phase_scales.append((mir_s, ratio))
                 for p in layer.mirror_parameters:
                     if p.grad is not None:
