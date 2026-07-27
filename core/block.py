@@ -95,12 +95,12 @@ class WideBindBlock(nn.Module):
             mem_state, mu_state, conv_state = state
         B, L, D = h.shape
 
-        if hasattr(self.mirror, '_cached_pred_error_norm') and self.mirror._cached_pred_error_norm is not None:
-            self.mirror._cached_pred_error_norm = self.mirror._cached_pred_error_norm.detach()
-        if hasattr(self.mirror, '_cached_hp') and self.mirror._cached_hp is not None:
-            self.mirror._cached_hp = self.mirror._cached_hp.detach()
-
         device = h.device
+        if hasattr(self.mirror, '_cached_pred_error_norm') and self.mirror._cached_pred_error_norm is not None:
+            self.mirror._cached_pred_error_norm = self.mirror._cached_pred_error_norm.detach().to(device)
+        if hasattr(self.mirror, '_cached_hp') and self.mirror._cached_hp is not None:
+            self.mirror._cached_hp = self.mirror._cached_hp.detach().to(device)
+
         h = F.rms_norm(h, (D,), self.pre_ln_w)
 
         if conv_state is None:
