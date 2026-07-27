@@ -521,7 +521,9 @@ class GroupedCognitiveMirror(nn.Module):
                 # Blend context override with learned memory (30% context, 70% learned)
                 keys = context_mem * 0.3 + keys * 0.7
                 keys = F.normalize(keys, dim=-1) * self._private_mem.norm(dim=-1, keepdim=True)
-            attn = F.softmax(q @ keys.T / math.sqrt(self.k), dim=-1)  # (B, L, G, G)
+            attn_logits = q @ keys.T / math.sqrt(self.k)  # (B, L, G, G)
+            attn = torch.sigmoid(attn_logits)  # independent per-pair, no sum-to-1 competition
+            attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-10)  # L1 normalize for stable scale
             help_k_base = attn @ keys  # (B, L, G, k) — collective confident memory
             # ─── Contradiction gate: disagreement between expert hp and collective help_k ───
             hp_n = hp.norm(dim=-1).clamp(min=1e-8)  # (B, L, G)
@@ -868,7 +870,7 @@ class BottleneckBind(nn.Module):
             nn.init.zeros_(self.w_gate_proj.bias)
 
         if self.mode == "cascade":
-            self.mix_logit = nn.Parameter(torch.zeros(self.S))
+            self.mix_logit = nn.Parameter(fib_sigmoid_init(self.S))
 
     def _tie_hook(self, module, inp):
         with torch.no_grad():
@@ -917,7 +919,7 @@ class BottleneckBind(nn.Module):
                 crossed = self._cross(a[n-1] * self.w_u[n-1], a[n-2] * self.w_v[n-1], self.shifts[n-1])
                 a[n] = F.normalize(crossed + 1e-10, dim=-1) * seed_norm
 
-            mix = torch.softmax(self.mix_logit, dim=0)
+            mix = torch.sigmoid(self.mix_logit)  # (S,) — sigmoid+Fib, no sum-to-1
             if not self._tied and self.ocular == "multi":
                 out = None
                 for n in range(1, self.S + 1):
