@@ -61,7 +61,8 @@ sigmoid по `scale_w` (без sum-to-1, полный ранг Jacobian). Это
 очень длинный (τ=512). Инициализация — иерархия Фибоначчи [1,1,2,3] → sigmoid
 [0.143, 0.143, 0.286, 0.429]: медленные шкалы получают больший вес и градиент.
 
-surprisal-gated i_gate, dual readout + first moment. fp32 guard для численной стабильности.
+surprisal-gated i_gate, dual readout + first moment. **Per-expert dynamic read**: каждый
+эксперт модулирует чтение из VSA через свой K-space (`w_q_dyn`). fp32 guard для численной стабильности.
 
 Пять гиперпараметров адаптируются через AdaptiveController из сигналов mirror:
 write gate, read gate, decay, memory-to-value scale, noise.
@@ -203,12 +204,12 @@ gate_logits = |pred_error| @ w_gate          # Layer 0: "я не знаю это
 |-----------|-----------|----|
 | Embed + LM Head | 51,920 | 0.42 |
 | BottleneckBind (K=32, S=4 multi-ocular) | 1,723,776 | 13.96 |
-| GroupedCognitiveMirror (staircase k=8/16/32) | 239,612 | 1.94 |
-| Conv1d (k=48, groups=D) | 521,472 | 4.22 |
+| GroupedCognitiveMirror (staircase k=8/16/32) | 239,612 | 1.91 |
+| Conv1d (k=48, groups=D) | 521,472 | 4.15 |
 | DCT Spectral (λ_k × D) | 10,752 | 0.09 |
-| VSA Gates + Multi-scale (w_i, w_q, scale_w, etc.) | 172,044 | 1.39 |
-| GroupedMLP (expand=4) | 9,644,640 | 78.11 |
-| **Total** | **~12.35M** | **100** |
+| VSA Gates + Multi-scale (w_i, w_q, scale_w, w_q_dyn, etc.) | 372,748 | 2.97 |
+| GroupedMLP (expand=4) | 9,644,640 | 76.86 |
+| **Total** | **~12.55M** | **100** |
 
 При `--bind-twist-mode off`: BottleneckBind → 689,280 (S=1, tied), total ~11.20M.
 
@@ -371,6 +372,13 @@ VSA память дрейфовала. **Fix**: λ_d LR hierarchy — 6 уров
 При стабильной `_private_mem` (norm > 3) decay → 0.999.
 Переход плавный через `sigmoid(3.0 - pm_norm)`.
 
+### 5.12 gamma_surprisal dead code
+`_cached_pred_error_norm` сбрасывался в `None` в начале каждого forward (до VSA секции).
+Поскольку mirror запускается после VSA, кэш всегда был пуст — gamma_surprisal никогда
+не получал градиент. **Fix**: удалён `self.mirror._cached_pred_error_norm = None`,
+вместо этого `.detach()` кэша на старте forward предотвращает backward через stale граф.
+γ теперь получает градиент от ошибки предсказания mirror с задержкой в 1 шаг (one-step delay).
+
 ---
 
 ## 6. Структура проекта
@@ -428,6 +436,8 @@ tok/s: ~56 (MX550, L=512).
 
 | Изменение | Описание |
 |-----------|----------|
+| **Per-expert dynamic memory read** | Каждый эксперт использует свой K-space (`hp`) для генерации per-token read_mod вектора через `w_q_dyn` (G×k×d). Позволяет экспертам индивидуально и контекстно-зависимо выбирать ЧТО читать из общей VSA памяти, а не просто усиливать/ослаблять общий `mem_read`. |
+| **gamma_surprisal gradient flow** | `_cached_pred_error_norm` больше не сбрасывается в None перед VSA секцией. Используется `.detach()` для предотвращения backward через stale граф. Теперь γ получает градиент от ошибки предсказания mirror, модулируя write gate i_gate. |
 | **Signal weights: softmax→sigmoid+Fib** | `_signal_log_weights`: sigmoid + Fibonacci [1,1,2,3,5]. Диагональный Jacobian, полный ранг, независимые градиенты. Медленные сигналы (help_k, sym_k) получают больший init вес. |
 | **scale_w: softmax→sigmoid+Fib** | 4 масштаба VSA: sigmoid + Fib [1,1,2,3]. Без sum-to-1, weight_decay=0 (группа vsa). Не толкает к равномерности. |
 | **Decorrelaton на взвешенных сигналах** | `decorr_loss` = Σ⟨w[i]·s_normed[i], w[j]·s_normed[j]⟩. Прямой градиент в `_signal_log_weights`, не размытый через 12 слоёв. |

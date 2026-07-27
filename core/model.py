@@ -1055,6 +1055,11 @@ class WideBindBlock(nn.Module):
         self.w_q_leaf = nn.Parameter(torch.full((cfg.D,), 1.0 / math.sqrt(cfg.D)))  # leaf-level within-chunk read
         self.w_q_ctx = nn.Parameter(torch.full((cfg.D,), 0.5 / math.sqrt(cfg.D)))  # cross-chunk context read
         self.w_mem2v = nn.Parameter(torch.randn(cfg.D))
+        # Per-expert dynamic read modulation: hp (G, k) -> read_mod (G, d)
+        g = self.mirror.G
+        d = self.mirror.d
+        k = self.mirror.k
+        self.w_q_dyn = nn.Parameter(torch.randn(g, k, d) * (1.0 / math.sqrt(k)))
         # Per-scale per-channel combination weights (sigmoid + Fibonacci)
         self.scale_w = nn.Parameter(fib_sigmoid_init(self._n_scales).unsqueeze(1).expand(-1, cfg.D).clone())
         # Linear decay across layers: shallow → short memory, deep → long
@@ -1101,8 +1106,9 @@ class WideBindBlock(nn.Module):
         if state is not None:
             mem_state, mu_state, conv_state = state
         B, L, D = h.shape
-        # Clear stale mirror cache
-        self.mirror._cached_pred_error_norm = None
+        # Detach cached pred_error_norm from previous graph to avoid backward through stale graph
+        if hasattr(self.mirror, '_cached_pred_error_norm') and self.mirror._cached_pred_error_norm is not None:
+            self.mirror._cached_pred_error_norm = self.mirror._cached_pred_error_norm.detach()
         K = self.K
         device = h.device
         
@@ -1248,7 +1254,13 @@ class WideBindBlock(nn.Module):
         mm = mm.unsqueeze(-1)  # (B, L, G, 1)
         g = self.mirror.G
         d = self.mirror.d
-        mem_modulated = (mem_read.reshape(B, L, g, d) * mm).reshape(B, L, D)
+        # Per-expert dynamic read modulation from K-space state
+        hp = self.mirror._cached_hp  # (B, L, G, k)
+        read_mod = torch.einsum('blgk,gkd->blgd', hp, self.w_q_dyn)  # (B, L, G, d)
+        read_mod = torch.sigmoid(read_mod / math.sqrt(self.mirror.k))
+        mem_read_g = mem_read.reshape(B, L, g, d)
+        mem_expert = mem_read_g * read_mod  # per-expert content-aware read
+        mem_modulated = (mem_expert * mm).reshape(B, L, D)
         enhanced_base = bind_out + mem_modulated * self.w_mem2v * mem2v_scale
         enhanced = enhanced_base + mirror
         self._cache_bind_out = enhanced_base  # для branch_loss (с градиентом)
