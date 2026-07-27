@@ -487,35 +487,47 @@ class WideBindStack(nn.Module):
             'ls_reg': log_scale_reg.item() if isinstance(log_scale_reg, torch.Tensor) else log_scale_reg,
             'decorr': decorr_loss.item() if isinstance(decorr_loss, torch.Tensor) else decorr_loss,
         }
+        cfg = self.cfg
+        w_gate = getattr(cfg, 'gate_l1_weight', 0.0)
+        w_reinf = getattr(cfg, 'reinforce_weight', 0.0)
+        w_balance = getattr(cfg, 'balance_weight', 0.0)
+        w_diversity = getattr(cfg, 'diversity_weight', 0.0)
+        w_nuc = getattr(cfg, 'nuclear_weight', 0.0)
+        w_orth = getattr(cfg, 'orth_weight', 0.0)
+        w_wm2v = getattr(cfg, 'w_m2v_hierarchy_weight', 0.0)
+        w_branch = getattr(cfg, 'branch_balance_weight', 0.0)
+        w_div = getattr(cfg, 'div_weight', 0.0)
+        w_rank = getattr(cfg, 'ranking_weight', 0.0)
+        w_ls = getattr(cfg, 'log_scale_l2_weight', 0.0)
         aux_dict = {}
         if pred_loss != 0:
             aux_dict['pred'] = pred_loss
-        if gate_l1 != 0:
-            aux_dict['gate_l1'] = gate_l1
-        if reinforce_loss != 0:
-            aux_dict['reinforce'] = reinforce_loss
-        if balance_loss != 0:
-            aux_dict['balance'] = balance_loss
-        if diversity_loss != 0:
-            aux_dict['diversity'] = diversity_loss
-        if nuc_loss != 0:
-            aux_dict['nuc'] = nuc_loss
-        if orth_loss != 0:
-            aux_dict['orth'] = orth_loss
-        if w_m2v_loss != 0:
-            aux_dict['w_m2v'] = w_m2v_loss
-        if branch_loss != 0:
-            aux_dict['branch'] = branch_loss
-        if div_loss_raw != 0:
-            aux_dict['div'] = div_loss_raw
-        if ranking_loss != 0:
-            aux_dict['ranking'] = ranking_loss
+        if gate_l1 != 0 and w_gate > 0:
+            aux_dict['gate_l1'] = gate_l1 * w_gate
+        if reinforce_loss != 0 and w_reinf > 0:
+            aux_dict['reinforce'] = reinforce_loss * w_reinf
+        if balance_loss != 0 and w_balance > 0:
+            aux_dict['balance'] = balance_loss * w_balance
+        if diversity_loss != 0 and w_diversity > 0:
+            aux_dict['diversity'] = diversity_loss * w_diversity
+        if nuc_loss != 0 and w_nuc > 0:
+            aux_dict['nuc'] = nuc_loss * w_nuc
+        if orth_loss != 0 and w_orth > 0:
+            aux_dict['orth'] = orth_loss * w_orth
+        if w_m2v_loss != 0 and w_wm2v > 0:
+            aux_dict['w_m2v'] = w_m2v_loss * w_wm2v
+        if branch_loss != 0 and w_branch > 0:
+            aux_dict['branch'] = branch_loss * w_branch
+        if div_loss_raw != 0 and w_div > 0:
+            aux_dict['div'] = div_loss_raw * w_div
+        if ranking_loss != 0 and w_rank > 0:
+            aux_dict['ranking'] = ranking_loss * w_rank
         if n_decorr > 0:
             aux_dict['decorr'] = decorr_loss
         if n_sig > 0:
             aux_dict['signal_ent'] = signal_entropy
-        if log_scale_reg != 0:
-            aux_dict['ls_reg'] = log_scale_reg
+        if log_scale_reg != 0 and w_ls > 0:
+            aux_dict['ls_reg'] = log_scale_reg * w_ls
         return ce_loss, aux_dict
 
     def param_count(self):
