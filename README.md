@@ -1,6 +1,6 @@
 # WideBind Mini
 
-**11.20M параметров (default), 12 слоёв, D=896.** Локальный тренировочный полигон для архитектуры WideBind.
+**11.75M параметров (default), 12 слоёв, D=896.** Локальный тренировочный полигон для архитектуры WideBind.
 Единственная известная архитектура с трёхслойным дифференцируемым аппаратом саморефлексии:
 знание → мета-знание (private memory) → арбитр (contradiction gate).
 
@@ -61,8 +61,11 @@ sigmoid по `scale_w` (без sum-to-1, полный ранг Jacobian). Это
 очень длинный (τ=512). Инициализация — иерархия Фибоначчи [1,1,2,3] → sigmoid
 [0.143, 0.143, 0.286, 0.429]: медленные шкалы получают больший вес и градиент.
 
-surprisal-gated i_gate, dual readout + first moment. **Per-expert dynamic read**: каждый
-эксперт модулирует чтение из VSA через свой K-space (`w_q_dyn`). fp32 guard для численной стабильности.
+surprisal-gated i_gate, **per-expert dynamic write** (`w_i_dyn`), dual readout + first moment.
+**Per-expert dynamic read** (`w_q_dyn`): каждый эксперт модулирует чтение из VSA через свой K-space. 
+**Prediction-error-aware decay** (`w_d_pen`): высокая ошибка → быстрое забывание. 
+**Context-dependent BottleneckBind**: выход bind гейтируется per-expert `usefulness` от mirror.
+fp32 guard для численной стабильности.
 
 Пять гиперпараметров адаптируются через AdaptiveController из сигналов mirror:
 write gate, read gate, decay, memory-to-value scale, noise.
@@ -207,9 +210,9 @@ gate_logits = |pred_error| @ w_gate          # Layer 0: "я не знаю это
 | GroupedCognitiveMirror (staircase k=8/16/32) | 239,612 | 1.91 |
 | Conv1d (k=48, groups=D) | 521,472 | 4.15 |
 | DCT Spectral (λ_k × D) | 10,752 | 0.09 |
-| VSA Gates + Multi-scale (w_i, w_q, scale_w, w_q_dyn, etc.) | 372,748 | 2.97 |
-| GroupedMLP (expand=4) | 9,644,640 | 76.86 |
-| **Total** | **~12.55M** | **100** |
+| VSA Gates + Multi-scale (w_i, w_q, scale_w, w_q_dyn, w_i_dyn, w_d_pen, w_bind_gate) | 562,892 | 4.41 |
+| GroupedMLP (expand=4) | 9,644,640 | 75.65 |
+| **Total** | **~12.75M** | **100** |
 
 При `--bind-twist-mode off`: BottleneckBind → 689,280 (S=1, tied), total ~11.20M.
 
@@ -379,6 +382,19 @@ VSA память дрейфовала. **Fix**: λ_d LR hierarchy — 6 уров
 вместо этого `.detach()` кэша на старте forward предотвращает backward через stale граф.
 γ теперь получает градиент от ошибки предсказания mirror с задержкой в 1 шаг (one-step delay).
 
+### 5.13 Per-expert dynamic memory operations (July 2026)
+Три новых механизма, делающих VSA memory интеллектуальной на уровне экспертов:
+
+**Write (`w_i_dyn`)**: каждый эксперт через K-space проекцию решает, какие измерения h
+записывать в общую VSA память. Использует hp с предыдущего шага (one-step delay, как γ).
+
+**Decay (`w_d_pen`)**: эксперты с высокой pred_error забывают быстрее.
+`d_mod *= 1 + 0.5·sigmoid(pen + w_d_pen[g])` — максимальное ускорение распада ×1.5.
+
+**Bind gate (`w_bind_gate`)**: BottleneckBind больше не статичен — его выход гейтируется
+per-expert `usefulness` от mirror, делая проекцию контекстно-зависимой.
+`bind_gated = bind_out * mm * sigmoid(w_bind_gate)`.
+
 ---
 
 ## 6. Структура проекта
@@ -437,6 +453,9 @@ tok/s: ~56 (MX550, L=512).
 | Изменение | Описание |
 |-----------|----------|
 | **Per-expert dynamic memory read** | Каждый эксперт использует свой K-space (`hp`) для генерации per-token read_mod вектора через `w_q_dyn` (G×k×d). Позволяет экспертам индивидуально и контекстно-зависимо выбирать ЧТО читать из общей VSA памяти, а не просто усиливать/ослаблять общий `mem_read`. |
+| **Per-expert dynamic write** | Симметрично чтению: `w_i_dyn` (G×k×d) модулирует запись в VSA — каждый эксперт контролирует какие измерения `h` попадают в память, через свою K-space проекцию с предыдущего шага. |
+| **Prediction-error-aware decay** | `w_d_pen` (G) — эксперты с высокой ошибкой предсказания забывают быстрее в своём подпространстве. Decay модулируется `pen` через `1 + 0.5·sigmoid(pen + w_d_pen[g])`. |
+| **Context-dependent BottleneckBind** | `w_bind_gate` (G) — выход bind гейтируется per-expert `usefulness` от mirror, делая билинейную проекцию контекстно-зависимой. |
 | **gamma_surprisal gradient flow** | `_cached_pred_error_norm` больше не сбрасывается в None перед VSA секцией. Используется `.detach()` для предотвращения backward через stale граф. Теперь γ получает градиент от ошибки предсказания mirror, модулируя write gate i_gate. |
 | **Signal weights: softmax→sigmoid+Fib** | `_signal_log_weights`: sigmoid + Fibonacci [1,1,2,3,5]. Диагональный Jacobian, полный ранг, независимые градиенты. Медленные сигналы (help_k, sym_k) получают больший init вес. |
 | **scale_w: softmax→sigmoid+Fib** | 4 масштаба VSA: sigmoid + Fib [1,1,2,3]. Без sum-to-1, weight_decay=0 (группа vsa). Не толкает к равномерности. |

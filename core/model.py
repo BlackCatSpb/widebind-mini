@@ -1060,6 +1060,12 @@ class WideBindBlock(nn.Module):
         d = self.mirror.d
         k = self.mirror.k
         self.w_q_dyn = nn.Parameter(torch.randn(g, k, d) * (1.0 / math.sqrt(k)))
+        # Per-expert write modulation: hp (G, k) -> write_mask (G, d)
+        self.w_i_dyn = nn.Parameter(torch.randn(g, k, d) * (1.0 / math.sqrt(k)))
+        # Per-expert decay sensitivity to prediction error
+        self.w_d_pen = nn.Parameter(torch.zeros(g))
+        # Per-expert bind gate (learned base openness)
+        self.w_bind_gate = nn.Parameter(torch.zeros(g))
         # Per-scale per-channel combination weights (sigmoid + Fibonacci)
         self.scale_w = nn.Parameter(fib_sigmoid_init(self._n_scales).unsqueeze(1).expand(-1, cfg.D).clone())
         # Linear decay across layers: shallow → short memory, deep → long
@@ -1106,9 +1112,11 @@ class WideBindBlock(nn.Module):
         if state is not None:
             mem_state, mu_state, conv_state = state
         B, L, D = h.shape
-        # Detach cached pred_error_norm from previous graph to avoid backward through stale graph
+        # Detach cached signals from previous graph to avoid backward through stale graph
         if hasattr(self.mirror, '_cached_pred_error_norm') and self.mirror._cached_pred_error_norm is not None:
             self.mirror._cached_pred_error_norm = self.mirror._cached_pred_error_norm.detach()
+        if hasattr(self.mirror, '_cached_hp') and self.mirror._cached_hp is not None:
+            self.mirror._cached_hp = self.mirror._cached_hp.detach()
         K = self.K
         device = h.device
         
@@ -1140,6 +1148,11 @@ class WideBindBlock(nn.Module):
             igate_logit = igate_logit + self.gamma_surprisal * pen.unsqueeze(-1)
         i_gate = F.softplus(igate_logit)                    # (B, L, D)
         d_mod = torch.sigmoid(h * self.w_d + self.b_d)      # (B, L, D) — content mod of decay
+        # Prediction-error-aware decay: high error → faster forgetting in that expert's subspace
+        if hasattr(mir, '_cached_pred_error_norm') and mir._cached_pred_error_norm is not None:
+            pen = mir._cached_pred_error_norm  # (B, L), already detached at start
+            d_pen_factor = 1.0 + 0.5 * torch.sigmoid(pen.unsqueeze(-1) + self.w_d_pen.unsqueeze(0).unsqueeze(0))
+            d_mod = (d_mod.reshape(B, L, self.mirror.G, self.mirror.d) * d_pen_factor.unsqueeze(-1)).reshape(B, L, D)
         if noise_scale > 0 and self.training:
             noise = 1.0 + noise_scale * torch.randn_like(i_gate)
             i_gate = i_gate * noise
@@ -1149,7 +1162,14 @@ class WideBindBlock(nn.Module):
         d_mod_vec = d_mod.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
         decay = (d_s_vec * d_mod_vec).clamp(min=0.01)  # per-scale per-channel, floor 0.01
         
-        mem_input = h * i_gate  # (B, L, D)
+        # Per-expert write modulation: each expert controls what dimensions of h enter memory
+        hp_cached = self.mirror._cached_hp  # detached, from previous forward
+        if hp_cached is not None and self.training:
+            write_mod = torch.einsum('blgk,gkd->blgd', hp_cached, self.w_i_dyn)
+            write_mod = torch.sigmoid(write_mod / math.sqrt(self.mirror.k))
+            mem_input = (h.reshape(B, L, self.mirror.G, self.mirror.d) * write_mod).reshape(B, L, D) * i_gate
+        else:
+            mem_input = h * i_gate  # (B, L, D)
         input_vec = mem_input.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
         
         eps = 1e-6
@@ -1261,7 +1281,10 @@ class WideBindBlock(nn.Module):
         mem_read_g = mem_read.reshape(B, L, g, d)
         mem_expert = mem_read_g * read_mod  # per-expert content-aware read
         mem_modulated = (mem_expert * mm).reshape(B, L, D)
-        enhanced_base = bind_out + mem_modulated * self.w_mem2v * mem2v_scale
+        # Per-expert gate for BottleneckBind: mirror's usefulness modulates bind output
+        bind_gate = torch.sigmoid(self.w_bind_gate).unsqueeze(0).unsqueeze(0)  # (1, 1, G)
+        bind_gated = (bind_out.reshape(B, L, g, d) * mm * bind_gate.unsqueeze(-1)).reshape(B, L, D)
+        enhanced_base = bind_gated + mem_modulated * self.w_mem2v * mem2v_scale
         enhanced = enhanced_base + mirror
         self._cache_bind_out = enhanced_base  # для branch_loss (с градиентом)
         self._cache_mirror_out = mirror  # для branch_loss (с градиентом)
