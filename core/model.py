@@ -2125,8 +2125,18 @@ class MirrorLRScheduler:
         return var_sum / n, mag_sum / n, alpha_sum / n, gate_var_sum / n
 
     def report_val_loss(self, val_loss):
-        """Report validation loss (kept for interface compatibility, no LR damping)."""
-        pass
+        """Loss damping: val_loss regression >2% → _loss_lr_factor halved (ReduceLROnPlateau).
+        Resets to 1.0 on new best. Applied as additional mult on top of mirror_mult."""
+        if not hasattr(self, '_best_val_loss'):
+            self._best_val_loss = val_loss
+            self._loss_lr_factor = 1.0
+            return
+        if val_loss < self._best_val_loss * 0.999:
+            self._best_val_loss = val_loss
+            self._loss_lr_factor = 1.0
+        elif val_loss > self._best_val_loss * 1.02:
+            self._loss_lr_factor *= 0.5
+            self._loss_lr_factor = max(self._loss_lr_factor, 0.01)
 
     def step(self):
         self._step += 1
@@ -2183,11 +2193,14 @@ class MirrorLRScheduler:
 
             mirror_mult = (var_mult * alpha_mult * gate_mult) ** (1/3) * mag_factor
             mult = max(0.05, min(1.0, mirror_mult))
+            loss_factor = getattr(self, '_loss_lr_factor', 1.0)
+            mult *= loss_factor
 
             if self._step - self._last_log >= 500:
                 self._last_log = self._step
                 print(f'  lr_adapt: var(ls)={var:.6f} |1-a|={mean_1malpha:.6f} '
                       f'gate_var={gate_var:.6f} |mirror|={mag:.4f} '
+                      f'loss_f={loss_factor:.4f} '
                       f'mult={mult:.4f} lr={self.base_lr*mult:.2e}')
 
         for i, pg in enumerate(self.optimizer.param_groups):
@@ -2197,7 +2210,7 @@ class MirrorLRScheduler:
         return [pg['lr'] for pg in self.optimizer.param_groups]
 
     def state_dict(self):
-        return {
+        d = {
             'step': self._step,
             'last_log': self._last_log,
             'type': 'MirrorLRScheduler',
@@ -2206,6 +2219,10 @@ class MirrorLRScheduler:
             'init_gate_var': self._init_gate_var,
             'orig_lrs': self._orig_lrs,
         }
+        if hasattr(self, '_best_val_loss'):
+            d['best_val_loss'] = self._best_val_loss
+            d['loss_lr_factor'] = self._loss_lr_factor
+        return d
 
     def load_state_dict(self, sd):
         self._step = sd.get('step', 0)
@@ -2215,6 +2232,9 @@ class MirrorLRScheduler:
         self._init_gate_var = sd.get('init_gate_var')
         if 'orig_lrs' in sd:
             self._orig_lrs = sd['orig_lrs']
+        if 'best_val_loss' in sd:
+            self._best_val_loss = sd['best_val_loss']
+            self._loss_lr_factor = sd.get('loss_lr_factor', 1.0)
 
     def reset_for_new_data(self, reset_warmup_steps=2000):
         self._init_var = None
