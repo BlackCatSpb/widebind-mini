@@ -16,9 +16,12 @@ import torch
 def load_cfg_and_model(ckpt_path, codebase=None):
     if codebase is not None:
         sys.path.insert(0, codebase)
-    from core import model as _mod, config as _cfg
+    from core import config as _cfg, WideBindStack as _ModelCls
+    from core import stack as _mod  # fallback for direct module access
     CfgCls = getattr(_cfg, 'WideBindConfig', getattr(_cfg, 'WideBandConfig', None))
     ModelCls = getattr(_mod, 'WideBindStack', getattr(_mod, 'WideBandStack', None))
+    if ModelCls is None:
+        ModelCls = _ModelCls
     if CfgCls is None or ModelCls is None:
         raise ImportError(f'Cannot find Config/Model class in {codebase or "."}')
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
