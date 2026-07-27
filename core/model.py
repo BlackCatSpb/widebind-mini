@@ -915,7 +915,7 @@ class BottleneckBind(nn.Module):
             seed_norm = a[1].norm(dim=-1, keepdim=True).detach()
             for n in range(3, self.S + 1):
                 crossed = self._cross(a[n-1] * self.w_u[n-1], a[n-2] * self.w_v[n-1], self.shifts[n-1])
-                a[n] = F.normalize(crossed, dim=-1) * seed_norm
+                a[n] = F.normalize(crossed + 1e-10, dim=-1) * seed_norm
 
             mix = torch.softmax(self.mix_logit, dim=0)
             if not self._tied and self.ocular == "multi":
@@ -1141,7 +1141,7 @@ class WideBindBlock(nn.Module):
         # Vectorize over S scales: (B, L, D) → (B, L, S*D)
         d_s_vec = d_s.view(1, 1, S, 1).expand(B, L, S, D).reshape(B, L, S * D)
         d_mod_vec = d_mod.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
-        decay = d_s_vec * d_mod_vec  # each scale: d_s · content_mod
+        decay = (d_s_vec * d_mod_vec).clamp(min=0.01)  # per-scale per-channel, floor 0.01
         
         mem_input = h * i_gate  # (B, L, D)
         input_vec = mem_input.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
