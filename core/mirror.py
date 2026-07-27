@@ -417,9 +417,10 @@ class GroupedCognitiveMirror(nn.Module):
         info['private_mem_norm'] = self._private_mem.norm(dim=-1).mean().item()
         info['w_help'] = torch.sigmoid(self.w_help).mean().item()
         info['w_contra'] = self.w_contra.mean().item()
-        w = torch.softmax(self._signal_log_weights, dim=0)
+        w = torch.sigmoid(self._signal_log_weights)
+        w_norm = w / (w.sum() + 1e-10)
         for i, label in enumerate(['temp','pred','smooth','sym','help'][:len(w)]):
-            info[f'signal_w_{label}'] = w[i].item()
+            info[f'signal_w_{label}'] = w_norm[i].item()
         if self._cached_contra_expert is not None:
             info['contra_expert'] = self._cached_contra_expert.mean().item()
             info['contra_expert_raw'] = self._cached_contra_expert.tolist()
