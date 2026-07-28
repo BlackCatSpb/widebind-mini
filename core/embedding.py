@@ -6,6 +6,12 @@ from .config import WideBindConfig
 from .vsa_utils import zeckendorf_codes, sparse_block_codes
 
 
+def has_nan_inf(t, label=''):
+    if t.is_floating_point() and (t.isnan().any() or t.isinf().any()):
+        return True
+    return False
+
+
 class ZeckendorfEmbedding(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -38,7 +44,10 @@ class PartitionedEmbedding(nn.Module):
         codes = self.codes[tokens]
         codes = torch.sigmoid(torch.einsum('blk,kj->blj', codes, self.embed_mix) * self._mix_scale)
         B, L = tokens.shape
-        return torch.einsum('blk,kd->blkd', codes, self.basis).reshape(B, L, -1)
+        out = torch.einsum('blk,kd->blkd', codes, self.basis).reshape(B, L, -1)
+        if has_nan_inf(out):
+            out = torch.nan_to_num(out, nan=0.0, posinf=1e4, neginf=-1e4)
+        return out
 
 
 class LmHead(nn.Module):

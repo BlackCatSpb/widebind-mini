@@ -94,6 +94,8 @@ class WideBindBlock(nn.Module):
         if state is not None:
             mem_state, mu_state, conv_state = state
         B, L, D = h.shape
+        NaN = float('nan')
+        self._nan_at = None
 
         device = h.device
         if hasattr(self.mirror, '_cached_pred_error_norm') and self.mirror._cached_pred_error_norm is not None:
@@ -109,7 +111,14 @@ class WideBindBlock(nn.Module):
             else:
                 self.mirror._cached_hp = hp.detach().to(device)
 
+        def _chk(t, label):
+            if t.is_floating_point() and (t.isnan().any() or t.isinf().any()):
+                self._nan_at = f'L{self.layer_idx}.{label}[{t.min():.2f},{t.max():.2f}]'
+                return True
+            return False
+
         h = F.rms_norm(h, (D,), self.pre_ln_w)
+        if _chk(h, 'rms_norm'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
 
         if conv_state is None:
             conv_state = torch.zeros(B, D, self.conv.padding[0], device=device, dtype=h.dtype)
@@ -118,9 +127,11 @@ class WideBindBlock(nn.Module):
         h_conv = h_conv[..., :L].transpose(1, 2)
         conv_state_out = h_perm[:, :, -(self.conv.padding[0]):]
         h = h + h_conv
+        if _chk(h, 'conv'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
         self._cache_conv_out = h_conv
 
         bind_out = self.bind(h)
+        if _chk(bind_out, 'bind'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
 
         S = self._n_scales
         tau_s = self._tau_s if tau_s is None else tau_s
@@ -231,10 +242,15 @@ class WideBindBlock(nn.Module):
         mem_read = mem_read + mu_read * self.w_mu_mem
         mu_state_out = mu_state_out_vec.reshape(B, S * D)
 
+        if _chk(mem_read, 'mem_read'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
+
         mirror, mlp_mod, mem_mod = self.mirror(
             h, mem_all, global_state=global_state, diff=diff,
             tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
             context_mem=context_mem, allow_write=allow_write)
+        if _chk(mirror, 'mirror_out'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
+        if _chk(mlp_mod, 'mlp_mod'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
+        if _chk(mem_mod, 'mem_mod'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
 
         mm = mem_mod
         mm = mm.unsqueeze(-1)
@@ -250,17 +266,22 @@ class WideBindBlock(nn.Module):
         bind_gated = (bind_out.reshape(B, L, g, d) * mm * bind_gate.unsqueeze(-1)).reshape(B, L, D)
         enhanced_base = bind_gated + mem_modulated * self.w_mem2v * mem2v_scale
         enhanced = enhanced_base + mirror
+        if _chk(enhanced, 'enhanced'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
         self._cache_bind_out = enhanced_base
         self._cache_mirror_out = mirror
         h = h + enhanced
+        if _chk(h, 'post_enhanced'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
 
         h_dct = h @ self.V_dct.T
         h = h + (h_dct * self.lambda_k * spectral_mod) @ self.V_dct
+        if _chk(h, 'spectral'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
 
         h_mlp = self.mlp(h)
+        if _chk(h_mlp, 'mlp_out'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
         mm2 = mlp_mod.unsqueeze(-1)
         h_mlp = (h_mlp.reshape(B, L, g, d) * mm2).reshape(B, L, D)
         h = h + h_mlp
+        if _chk(h, 'post_mlp'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
 
         return h, (mem_state_out, mu_state_out, conv_state_out)
 
