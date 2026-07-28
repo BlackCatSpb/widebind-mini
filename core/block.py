@@ -147,7 +147,7 @@ class WideBindBlock(nn.Module):
 
         if hasattr(mir, '_cached_pred_error_norm') and mir._cached_pred_error_norm is not None:
             pen = mir._cached_pred_error_norm
-            d_pen_factor = 1.0 + 0.5 * torch.sigmoid(pen.unsqueeze(-1) + self.w_d_pen.unsqueeze(0).unsqueeze(0))
+            d_pen_factor = 1.0 - 0.5 * torch.sigmoid(pen.unsqueeze(-1) + self.w_d_pen.unsqueeze(0).unsqueeze(0))
             d_mod = (d_mod.reshape(B, L, self.mirror.G, self.mirror.d) * d_pen_factor.unsqueeze(-1)).reshape(B, L, D)
 
         if noise_scale > 0 and self.training:
@@ -156,7 +156,7 @@ class WideBindBlock(nn.Module):
 
         d_s_vec = d_s.view(1, 1, S, 1).expand(B, L, S, D).reshape(B, L, S * D)
         d_mod_vec = d_mod.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
-        decay = (d_s_vec * d_mod_vec).clamp(min=0.01)
+        decay = (d_s_vec * d_mod_vec).clamp(min=0.01, max=1.0)
 
         hp_cached = self.mirror._cached_hp
         if hp_cached is not None and self.training:
