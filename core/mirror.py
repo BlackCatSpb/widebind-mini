@@ -47,7 +47,8 @@ class GroupedCognitiveMirror(nn.Module):
 
     def __init__(self, D, G=32, k=32, w_pred_scale_init=3.0, log_scale_init_std=0.05,
                  delta_var_ema_min=0.8, delta_var_ema_max=0.99, tie_mirror_proj=False,
-                 layer_idx=0, n_layers=32, has_private_mem=False):
+                 layer_idx=0, n_layers=32, has_private_mem=False,
+                 expert_asymmetry=False, meta_trust=False):
         super().__init__()
         assert D % G == 0
         self.D = D
@@ -60,7 +61,13 @@ class GroupedCognitiveMirror(nn.Module):
 
         proj_std = 1.0 / (self.d * k) ** 0.25
 
-        self.W_proj = nn.Parameter(torch.randn(G, self.d, k) * proj_std)
+        if expert_asymmetry:
+            W_p = torch.empty(G, self.d, k)
+            for g in range(G):
+                nn.init.orthogonal_(W_p[g])
+            self.W_proj = nn.Parameter(W_p)
+        else:
+            self.W_proj = nn.Parameter(torch.randn(G, self.d, k) * proj_std)
         if tie_mirror_proj:
             self.register_buffer('W_out', torch.zeros(G, k, self.d))
             with torch.no_grad():
@@ -89,12 +96,20 @@ class GroupedCognitiveMirror(nn.Module):
         else:
             tau_k = torch.tensor([(tau_min + tau_max) / 2])
         alpha_init = torch.exp(-1.0 / tau_k).view(1, k).expand(G, -1).clone()
+        if expert_asymmetry and G > 1:
+            for g in range(G):
+                init_alpha = 0.85 + (g / (G - 1)) * 0.14
+                alpha_init[g] = init_alpha
         self.alpha_diag = nn.Parameter(alpha_init)
         self.w_pred_scale_legacy = nn.Parameter(torch.ones(G, k))
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         n_signals = 5 if has_private_mem else 4
         self.register_buffer('_signal_norm_ema', torch.ones(n_signals, G, k), persistent=False)
-        ls_base = torch.linspace(-0.3, 0.3, G).unsqueeze(1).expand(G, self.d)
+        if expert_asymmetry and G > 1:
+            ls_vals = [math.log(0.05 * (1.5 ** g)) for g in range(G)]
+            ls_base = torch.tensor(ls_vals).unsqueeze(1).expand(G, self.d)
+        else:
+            ls_base = torch.linspace(-0.3, 0.3, G).unsqueeze(1).expand(G, self.d)
         self.log_scale = nn.Parameter(ls_base + torch.randn(G, self.d) * 0.01)
 
         gate_std = 1.0 / (self.k + 1) ** 0.5
@@ -103,6 +118,8 @@ class GroupedCognitiveMirror(nn.Module):
         self.w_delta_gate = nn.Parameter(torch.randn(G, self.k) / math.sqrt(self.k))
 
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
+        self._expert_asymmetry = expert_asymmetry
+        self._meta_trust = meta_trust
         self._has_private_mem = has_private_mem
         self._pm_write_delay = 5000
         if has_private_mem:
@@ -113,6 +130,9 @@ class GroupedCognitiveMirror(nn.Module):
             self.register_buffer('_concept_sim_ema', torch.eye(G), persistent=False)
             self.register_buffer('_behavior_div_ema', torch.zeros(G, G), persistent=False)
             self.register_buffer('_trust_matrix', torch.eye(G) * 0.5, persistent=False)
+            if meta_trust:
+                self.register_buffer('_prev_trust_matrix', torch.eye(G) * 0.5, persistent=False)
+                self.register_buffer('_meta_private_mem', torch.zeros(G), persistent=False)
         self.register_buffer('_hp_grad', torch.zeros(G), persistent=False)
         self.register_buffer('_delta_var', torch.zeros(G), persistent=False)
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
@@ -209,7 +229,7 @@ class GroupedCognitiveMirror(nn.Module):
                 residual_var = pred_error.var(dim=(0, 1), unbiased=False)
                 self._residual_var_ema.lerp_(residual_var, 0.01)
                 rv = self._residual_var_ema
-                rv_mean = rv.mean(dim=-1, keepdim=True)
+                rv_mean = rv.mean(dim=0, keepdim=True)
                 relative_var = rv / (rv_mean + 1e-10)
                 alpha_target = torch.sigmoid(2.2 - torch.log(relative_var))
                 self.alpha_diag.data.lerp_(alpha_target, 0.01)
@@ -254,7 +274,13 @@ class GroupedCognitiveMirror(nn.Module):
                 behavior_div = 1.0 - behavior_sim
                 self._behavior_div_ema.mul_(0.99).add_(behavior_div, alpha=0.01)
                 trust_weights = attn.mean(dim=(0, 1))
+                if self._meta_trust and self._has_private_mem:
+                    self._prev_trust_matrix.copy_(self._trust_matrix)
                 self._trust_matrix.mul_(0.99).add_(trust_weights, alpha=0.01)
+                if self._meta_trust and self._has_private_mem:
+                    delta_tm = self._trust_matrix - self._prev_trust_matrix
+                    instability = delta_tm.abs().mean(dim=1)
+                    self._meta_private_mem.mul_(0.9).add_(instability, alpha=0.1)
                 contra_g = concept_sim * behavior_div
                 self._cached_contra_graph = contra_g
                 contra_expert = contra_g.mean(dim=-1)
@@ -365,7 +391,7 @@ class GroupedCognitiveMirror(nn.Module):
         linear = torch.einsum('blgk,gkd->blgd', delta, self.W_out)
         skip_alpha = torch.exp(self.log_skip_alpha).view(1, 1, G, 1)
         mirror = torch.tanh(linear) + skip_alpha * linear
-        mirror = mirror * torch.exp(self.log_scale * self._gate_ema.unsqueeze(-1))
+        mirror = mirror * torch.exp(self.log_scale)
 
         gate_signal = torch.abs(pred_error)
         gate_logits = torch.einsum('blgk,gk->blg', gate_signal, self.w_gate) + self.b_gate
@@ -384,6 +410,17 @@ class GroupedCognitiveMirror(nn.Module):
             cons = cons / (cons.max() + 1e-10)
             gate_bonus = (spec * 0.5 + cons * 0.5) * self.w_contra * 0.1
             gate_logits = gate_logits + gate_bonus.unsqueeze(0).unsqueeze(0)
+        if self._meta_trust and self._has_private_mem:
+            p = self._meta_private_mem.unsqueeze(0).unsqueeze(0)
+            gate_logits = gate_logits - 0.5 * p
+
+        if self.training:
+            ls = self.log_scale
+            ls_dev = ls.mean(dim=-1) - ls.mean()
+            ls_var = ls.var().item()
+            if ls_var < 0.05:
+                boost = 0.3 * torch.sigmoid(3.0 * ls_dev)
+                gate_logits = gate_logits + boost.unsqueeze(0).unsqueeze(0)
 
         expert_gate = torch.sigmoid(gate_logits)
         self._cached_gate_l1 = expert_gate.mean()

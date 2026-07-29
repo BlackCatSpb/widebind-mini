@@ -184,6 +184,14 @@ def train(cfg, data_dir, device):
 
             x, y = x.to(device), y.to(device)
 
+            # Read next 10 tokens for aux mirror (future context target)
+            aux_target = None
+            if cfg.aux_mirror_weight > 0:
+                need = cfg.batch_size * 10
+                if offset + need <= s.len:
+                    raw = s.data[offset:offset + need]
+                    aux_target = torch.from_numpy(raw.copy()).long().view(cfg.batch_size, 10).to(device)
+
             # Soft EOS reset: decay state instead of dropping it
             if (y[:, -1] == 2).any() and state is not None:
                 state = _soft_reset(state, factor=0.3)
@@ -194,6 +202,16 @@ def train(cfg, data_dir, device):
 
             # Compute losses (raw, unweighted)
             ce_loss, aux_dict = model.compute_losses(out, y)
+
+            # Aux mirror loss (predict macro-embedding of next 10 tokens from last state)
+            if aux_target is not None and model._cached_aux_pred is not None:
+                target_embed = model.embed_tokens(aux_target).mean(dim=1).detach()
+                with torch.no_grad():
+                    target_proj = model.aux_proj(target_embed)
+                aux_mirror_loss = (1.0 - F.cosine_similarity(
+                    model._cached_aux_pred, target_proj, dim=-1)).mean()
+                aux_dict['aux_mirror'] = aux_mirror_loss * cfg.aux_mirror_weight
+                model._cached_losses['aux_mirror'] = aux_mirror_loss.item()
 
             # NaN guard
             if torch.isnan(ce_loss) or torch.isinf(ce_loss):
@@ -362,6 +380,9 @@ if __name__ == '__main__':
     parser.add_argument('--compile', action='store_true', help='Enable torch.compile (~30% tok/s)')
     parser.add_argument('--div-weight', type=float, default=0.087, help='Expert diversity loss weight (pushes var(log_scale) up)')
     parser.add_argument('--private-mem', action='store_true', help='Enable cross-expert private memory bank')
+    parser.add_argument('--aux-mirror-weight', type=float, default=0.0, help='External mirror loss weight (0=off)')
+    parser.add_argument('--no-expert-asymmetry', action='store_true', help='Disable asymmetric expert init')
+    parser.add_argument('--no-meta-trust', action='store_true', help='Disable meta-trust instability penalty')
     parser.add_argument('--no-lambda', action='store_true', help='Disable lambda_d hierarchy')
     parser.add_argument('--accum', type=int, default=1, help='Gradient accumulation steps')
     parser.add_argument('--bind-twist-mode', default='shift', help='BottleneckBind twist mode (off/shift/cascade)')
@@ -389,6 +410,9 @@ if __name__ == '__main__':
         compile=args.compile,
         div_weight=args.div_weight,
         private_mem=args.private_mem,
+        aux_mirror_weight=args.aux_mirror_weight,
+        expert_asymmetry=not args.no_expert_asymmetry,
+        meta_trust=not args.no_meta_trust,
     )
 
     device = args.device if torch.cuda.is_available() else 'cpu'

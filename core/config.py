@@ -97,6 +97,15 @@ class WideBandConfig:
     ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (adaptive from here, scaled to 5% of CE)
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
 
+    # ─── Spec 1: Asymmetric expert init ───
+    expert_asymmetry: bool = True  # break symmetry: different alpha, log_scale, W_proj per expert
+
+    # ─── Spec 2: External mirror (auxiliary world model) ───
+    aux_mirror_weight: float = 0.0  # 0=off, 0.1=aux cosine loss weight
+
+    # ─── Spec 3: Recursive meta-trust ───
+    meta_trust: bool = True  # track trust dynamics, penalize unstable experts (requires private_mem)
+
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
 
     max_steps: int = 300000

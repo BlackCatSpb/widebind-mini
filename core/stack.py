@@ -138,6 +138,7 @@ class WideBindStack(nn.Module):
         ])
 
         self.register_buffer('final_norm_w', torch.ones(cfg.D))
+        self.aux_proj = nn.Linear(cfg.D, max(1, cfg.D // 8))
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
         self._tau_l_dev = nn.Parameter(torch.zeros(cfg.n_layers))
         tau_s = self.layers[0]._tau_s
@@ -265,6 +266,7 @@ class WideBindStack(nn.Module):
                 if mir._cached_pred_k is not None and mir._cached_hp is not None:
                     self._pred_cache.append((mir._cached_pred_k, mir._cached_hp))
 
+        self._cached_aux_pred = self.aux_proj(h[:, -1, :]) if self.training else None
         return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state, global_state
 
     def embed_tokens(self, tokens):

@@ -39,7 +39,9 @@ class WideBindBlock(nn.Module):
             delta_var_ema_min=cfg.delta_var_ema_min, delta_var_ema_max=cfg.delta_var_ema_max,
             tie_mirror_proj=cfg.tie_mirror_proj,
             layer_idx=layer_idx, n_layers=cfg.n_layers,
-            has_private_mem=cfg.private_mem)
+            has_private_mem=cfg.private_mem,
+            expert_asymmetry=cfg.expert_asymmetry,
+            meta_trust=cfg.meta_trust)
 
         self._n_scales = 4
         tau_s = torch.tensor([8, 32, 128, 512], dtype=torch.float32)
