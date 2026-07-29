@@ -236,12 +236,15 @@ def train(cfg, data_dir, device):
                     elif isinstance(v, torch.Tensor) and v.requires_grad:
                         aligned_dict[k] = v
 
-            # Bypass gradients: applied directly without spectral alignment
-            bypass_grads = {}
-            for k, v in bypass_losses.items():
-                if v is not None:
-                    bypass_grads[k] = torch.autograd.grad(
-                        v / accum, model.parameters(), allow_unused=True)
+            # Bypass gradients: single backward to avoid freeing graph multiple times
+            bypass_list = [v for v in bypass_losses.values() if v is not None]
+            if bypass_list:
+                bypass_total = sum(bypass_list) / accum
+                bypass_retain = bool(aligned_dict)  # keep graph for aux_total if needed
+                bypass_grads = torch.autograd.grad(
+                    bypass_total, model.parameters(), retain_graph=bypass_retain, allow_unused=True)
+            else:
+                bypass_grads = None
 
             # Spectral gradient alignment for non-div aux losses
             if aligned_dict:
@@ -263,7 +266,7 @@ def train(cfg, data_dir, device):
                 aux_grads = None
                 scale = 0.0
 
-            # Combine: g = g_CE + scale * g_aligned + sum(bypass_grads)
+            # Combine: g = g_CE + scale * g_aligned + bypass_grads
             with torch.no_grad():
                 for p, cg in zip(model.parameters(), ce_grads):
                     if cg is not None:
@@ -276,14 +279,13 @@ def train(cfg, data_dir, device):
                             p.grad.add_(ag, alpha=scale)
                         elif ag is not None:
                             p.grad = ag * scale
-                for gname, bgrads in bypass_grads.items():
-                    if bgrads is not None:
-                        for p, bg in zip(model.parameters(), bgrads):
-                            if bg is not None:
-                                if p.grad is not None:
-                                    p.grad.add_(bg)
-                                else:
-                                    p.grad = bg.clone()
+                if bypass_grads is not None:
+                    for p, bg in zip(model.parameters(), bypass_grads):
+                        if bg is not None:
+                            if p.grad is not None:
+                                p.grad.add_(bg)
+                            else:
+                                p.grad = bg.clone()
             
             # Adaptive phase scaling: EMA-based mirror/base gradient balance
             # mirror_scale = sigmoid((ratio - ratio_ema) / (ratio_std + 1e-8))
