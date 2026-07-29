@@ -224,14 +224,26 @@ def train(cfg, data_dir, device):
             ce_grads = torch.autograd.grad(ce_loss / accum, model.parameters(),
                                            retain_graph=bool(aux_dict), allow_unused=True)
 
-            # Spectral gradient alignment: scale aux by cos(g_CE, g_aux)
+            # Separate div loss from rest of aux (it fights CE, don't align spectrally)
+            div_loss = None
+            aligned_dict = {}
             if aux_dict:
-                aux_total = sum(
-                    v for v in aux_dict.values()
-                    if isinstance(v, torch.Tensor) and v.requires_grad
-                ) / accum
+                for k, v in aux_dict.items():
+                    if k == 'div':
+                        div_loss = v
+                    elif isinstance(v, torch.Tensor) and v.requires_grad:
+                        aligned_dict[k] = v
+
+            # Div gradient: applied directly without spectral alignment
+            div_grads = None
+            if div_loss is not None:
+                div_grads = torch.autograd.grad(
+                    div_loss / accum, model.parameters(), allow_unused=True)
+
+            # Spectral gradient alignment for non-div aux losses
+            if aligned_dict:
+                aux_total = sum(aligned_dict.values()) / accum
                 aux_grads = torch.autograd.grad(aux_total, model.parameters(), allow_unused=True)
-                # Flatten shared subspace (params where BOTH grads exist)
                 ce_list, aux_list = [], []
                 for gce, gaux in zip(ce_grads, aux_grads):
                     if gce is not None and gaux is not None:
@@ -245,21 +257,28 @@ def train(cfg, data_dir, device):
                 else:
                     scale = 0.0
             else:
+                aux_grads = None
                 scale = 0.0
 
-            # Combine: g = g_CE + scale * g_aux (scale > 0 only when aux aligns with CE)
+            # Combine: g = g_CE + scale * g_aligned + g_div
             with torch.no_grad():
                 for p, cg in zip(model.parameters(), ce_grads):
                     if cg is not None:
                         p.grad = cg.clone()
                     else:
                         p.grad = None
-                if aux_dict and scale > 0:
+                if aux_grads is not None and scale > 0:
                     for p, ag in zip(model.parameters(), aux_grads):
                         if p.grad is not None and ag is not None:
                             p.grad.add_(ag, alpha=scale)
                         elif ag is not None:
                             p.grad = ag * scale
+                if div_grads is not None:
+                    for p, dg in zip(model.parameters(), div_grads):
+                        if p.grad is not None and dg is not None:
+                            p.grad.add_(dg)
+                        elif dg is not None:
+                            p.grad = dg.clone()
             
             # Adaptive phase scaling: EMA-based mirror/base gradient balance
             # mirror_scale = sigmoid((ratio - ratio_ema) / (ratio_std + 1e-8))
