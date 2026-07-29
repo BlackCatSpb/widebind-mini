@@ -456,7 +456,7 @@ class Simulator:
         self.gate_repulse_weight = c.get('gate_repulse_weight', 0.0)
         self.alpha_novelty_weight = c.get('alpha_novelty_weight', 0.0)
         self.gate_bias_scale = c.get('gate_bias_scale', 0.0)
-        self.ls_init_range = c.get('ls_init_range', 0.6)
+        self.ls_init_range = c.get('ls_init_range', 0.0)  # 0 = use expert_asymmetry formula
         self.cos_sim_ce_aux = c.get('cos_sim_ce_aux', 0.0)
         self.cos_sim_ce_ranking = c.get('cos_sim_ce_ranking', 0.0)
         self.intra_weight = c.get('intra_weight', math.sqrt(112 / 8))  # sqrt(d/G)
@@ -473,10 +473,14 @@ class Simulator:
         self.reset()
     
     def reset(self):
-        r = self.ls_init_range
-        # log_scale: linspace(-r/2, r/2) per expert
-        # Actually: linspace(-0.3, 0.3, G) expanded to (G,d) with small noise
-        ls_base = torch.linspace(-r/2, r/2, self.G)
+        # log_scale: expert_asymmetry init (matches real model with expert_asymmetry=True)
+        # ls = log(0.05 * 1.5^g) for g in [0..G-1], expanded to d dims
+        if self.ls_init_range > 0:
+            r = self.ls_init_range
+            ls_base = torch.linspace(-r/2, r/2, self.G)
+        else:
+            ls_vals = [math.log(0.05 * (1.5 ** g)) for g in range(self.G)]
+            ls_base = torch.tensor(ls_vals)
         self.ls = ls_base.unsqueeze(1).expand(self.G, self.d).clone() + torch.randn(self.G, self.d) * 0.01
         
         # gate_logit: random init -> sigmoid gives gate_var ~ 0.03
@@ -486,11 +490,11 @@ class Simulator:
         if self.gate_bias_scale > 0:
             self.gate_logit = self.gate_logit + torch.linspace(-self.gate_bias_scale, self.gate_bias_scale, self.G)
         
-        # alpha: tau-based init
-        tau_min, tau_max = 2.0, 200.0
-        frac = torch.arange(self.k, dtype=torch.float32) / (self.k - 1)
-        tau_k = tau_min * (tau_max / tau_min) ** frac
-        alpha_init = torch.exp(-1.0 / tau_k).view(1, self.k).expand(self.G, -1).clone()
+        # alpha: tau-based init + expert_asymmetry override (matches real model)
+        alpha_init = torch.zeros(self.G, self.k)
+        for g in range(self.G):
+            init_alpha = 0.85 + (g / max(self.G - 1, 1)) * 0.14
+            alpha_init[g] = init_alpha
         self.alpha = alpha_init.clone()
         
         # residual_var_ema: starts at 0.1 per dim
@@ -528,26 +532,34 @@ class Simulator:
         ls_grad_div = (-self.div_weight * 2 * dsig * sig_center_exp / self.G
                        -self.div_weight * self.intra_weight * 2 * dsig * sig_center_dim / self.d)
         
-        # --- 3. L2 regularization on log_scale ----------------------
-        # reg = sum(clamp(exp(ls), max=10)^2) -> grad = 2*exp(2*ls) for ls where exp(ls) < 10
-        # Simplified: ls_grad_reg = -log_scale_l2_weight * 2 * self.ls
-        ls_grad_reg = -self.log_scale_l2_weight * 2 * self.ls
+        # --- 3. L2 regularization on log_scale (matches real model) ----
+        # reg = relu(ls - 2.3)^2 * w_ls  — soft cap at 2.3, no lower bound
+        # grad: 2 * (ls - 2.3) * w_ls for ls > 2.3, else 0
+        excess = (self.ls - 2.3).clamp(min=0)
+        ls_grad_reg = -self.log_scale_l2_weight * 2 * excess
         
-        # --- 4. Ranking gradient on ls_mean (if spectral allows) ----
+        # --- 4. Ranking gradient on ls_mean (bypasses spectral in real model) ----
         ls_grad_ranking = torch.zeros(self.G, self.d)
-        if self.spectral_scale_ranking > 0.05:
-            # ranking_loss = max(0, margin - (ls_mean[high] - ls_mean[low]))
-            # Simplified: push ls_mean toward gate_ema order
-            gate_order = self.gate_ema.argsort()
+        if self.ranking_weight > 0:
+            # ranking_loss = sum_i sum_j relu( -(ls_i - ls_j) ) * [gate_j > gate_i]
+            # Full pairwise: expert pair contributes iff gate orders opposite to ls orders
             ls_mean = self.ls.mean(dim=-1)
-            # Simple gradient: below-median ls_mean get positive push, above get negative
-            median = ls_mean.median()
-            rank_push = torch.where(ls_mean < median, 0.01, -0.01)
-            ls_grad_ranking = rank_push.unsqueeze(1).expand(-1, self.d) * 0.1
+            gate_usage = torch.sigmoid(self.gate_logit)
+            ls_pair = ls_mean.unsqueeze(1) - ls_mean.unsqueeze(0)  # G×G, + = ls_i > ls_j
+            gate_pair = gate_usage.unsqueeze(1) - gate_usage.unsqueeze(0)  # + = gate_i > gate_j
+            # Mask: pairs where gate_i > gate_j BUT ls_i <= ls_j (opposite ordering)
+            # relu(-ls_pair) * (gate_pair > 0)
+            # gradient: for expert i, sum over j where gate_i > gate_j and ls_i < ls_j
+            #   grad_i += -1 (push ls_i up to fix ordering)
+            #    grad_j += +1 (push ls_j down to fix ordering)
+            mask_down = (gate_pair > 0).float() * (ls_pair < 0).float()  # gate_i > gate_j, ls_i < ls_j
+            grad_per_pair = -mask_down + mask_down.t()  # asymmetry: grad_i = -sum_down, grad_j = +sum_up
+            ls_mean_grad_ranking = grad_per_pair.sum(dim=1)
+            # Scale by ranking_weight (the loss weight, 0.01 by default)
+            ls_grad_ranking = (ls_mean_grad_ranking * self.ranking_weight).unsqueeze(1).expand(-1, self.d)
         
-        # Combined ls gradient (no multiplier — ls_grad_div already includes div_weight)
-        ls_grad = (ls_grad_ce + ls_grad_div + ls_grad_reg
-                   + ls_grad_ranking * self.spectral_scale_ranking)
+        # Combined ls gradient — ranking bypasses spectral, div is its own gradient
+        ls_grad = (ls_grad_ce + ls_grad_div + ls_grad_reg + ls_grad_ranking)
         self.ls = self.ls - self.lr * ls_grad
         
         # --- 5. Alpha update ----------------------------------------
