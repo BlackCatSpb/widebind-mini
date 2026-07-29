@@ -518,8 +518,13 @@ class Simulator:
     def step(self, t):
         """One simulated training step."""
         
-        # --- 1. CE gradient on log_scale (modeled as random walk) ----
-        ls_grad_ce = torch.randn(self.G, self.d) * 0.01  # random CE noise, small
+        # --- 1. CE gradient on log_scale (modeled as random walk + restoring force) ----
+        # Restoring force: CE prefers moderate exp(ls) ≲ 10 (noise that doesn't destroy gates).
+        # High exp(ls) → high Gumbel noise → random gates → high CE loss.
+        # Pulls ls back toward initial expert_asymmetry values.
+        ls_init = torch.tensor([math.log(0.05 * (1.5 ** g)) for g in range(self.G)]).unsqueeze(1)
+        ls_grad_ce_restore = 0.05 * (self.ls - ls_init)  # restoring force
+        ls_grad_ce = torch.randn(self.G, self.d) * 0.01 + ls_grad_ce_restore
         
         # --- 2. Div gradient ----------------------------------------
         # div = -var(sigmoid(ls)) — bounded in [0, 0.25]
@@ -536,7 +541,7 @@ class Simulator:
         # reg = relu(ls - 2.3)^2 * w_ls  — soft cap at 2.3, no lower bound
         # grad: 2 * (ls - 2.3) * w_ls for ls > 2.3, else 0
         excess = (self.ls - 2.3).clamp(min=0)
-        ls_grad_reg = -self.log_scale_l2_weight * 2 * excess
+        ls_grad_reg = +self.log_scale_l2_weight * 2 * excess
         
         # --- 4. Ranking gradient on ls_mean (bypasses spectral in real model) ----
         ls_grad_ranking = torch.zeros(self.G, self.d)
@@ -565,10 +570,14 @@ class Simulator:
         # --- 5. Alpha update ----------------------------------------
         # pred_error -> residual_var -> alpha_target -> lerp
         # As model learns, pred_error decreases -> residual_var decreases
-        # Add per-expert noise to break symmetry (intelligent fix: "expert curiosity")
+        # Expert-specific residual (CE-driven diversity in real model).
+        # Uses FIXED per-expert noise (not resampled) so targets are stable over time.
+        # σ=0.8 creates ∼3x range in residual_var across 8 experts, producing
+        # alpha targets spanning ∼0.82-0.97 → stable, moderate alpha diversity.
+        if not hasattr(self, 'expert_noise_fixed'):
+            self.expert_noise_fixed = torch.exp(torch.randn(self.G, 1) * 0.8)
         pred_error_scale = max(0.01, 0.5 * math.exp(-t / 5000))
-        # Expert-specific residual scaling (different subspaces have different learnability)
-        expert_noise = torch.exp(torch.randn(self.G, 1) * 0.1)  # log-normal per-expert
+        expert_noise = self.expert_noise_fixed
         residual_var = torch.ones(self.G, self.k) * pred_error_scale * expert_noise
         self.residual_var_ema.mul_(0.99).add_(residual_var, alpha=0.01)
         
@@ -587,7 +596,10 @@ class Simulator:
         alpha_center = alpha_per_expert - alpha_per_expert.mean()
         alpha_novelty_grad = (+adapted_w * 2
                               * alpha_center.unsqueeze(1).expand(-1, self.k) / self.G)
-        self.alpha = self.alpha + alpha_novelty_grad  # direct update (not lr-scaled)
+        # Scale by alpha_lerp_rate to match adaptive lerp speed.
+        # Prevent binary collapse: without this scaling, the direct push
+        # overrides the noise-diversity targets from residual_var.
+        self.alpha = self.alpha + self.alpha_lerp_rate * alpha_novelty_grad
         self.alpha = torch.clamp(self.alpha, 0.01, 0.99)
         
         # --- 6. Gate update -----------------------------------------
@@ -611,25 +623,22 @@ class Simulator:
         # dCE/d(logit) = dCE/d(mirror) * mirror_raw * gate * (1-gate)
         # mirror_raw magnitude scales with exp(log_scale), so experts with
         # larger ls get stronger CE gradient on their gate.
-        ce_gate_grad_raw = torch.randn(self.G) * 0.01  # subspace-specific CE component
-        # LS coupling: higher ls -> more mirror impact -> stronger CE gate gradient
-        ls_activation = torch.exp(self.ls.mean(dim=-1)).detach()
-        ls_coupling = 0.02 * (ls_activation - ls_activation.mean()) / (ls_activation.std() + 1e-8)
-        ce_gate_grad = ce_gate_grad_raw + ls_coupling
+        ce_gate_grad = torch.randn(self.G) * 0.01  # subspace-specific CE component
         
         # --- Gate repulsion: inverse of balance, pushes gates apart ---
         # L_rep = -gate.var() * w_rep
         # dL/dlogit = -w_rep * 2 * (gate - gate.mean()) / G  (sigmoid derivative absorbed)
         # Direct gradient on logit (like div does on ls), not scaled by gate*(1-gate)
-        gate_rep_grad = (-self.gate_repulse_weight * 2 * (gate - gate.mean()) / self.G)
+        gate_rep_grad = (-self.gate_repulse_weight * 2 * (gate - gate.mean())
+                         * gate * (1 - gate) / self.G)
         
-        # Only balance + reinforce + l1 go through spectral alignment
-        # Gate repulsion is direct (bypasses spectral alignment, like div)
+        # All gate gradients go through spectral alignment (prevents polarization
+        # when spectral < 1: repulse would dominate balance without equal scaling).
         gate_grad = (ce_gate_grad
                      + self.spectral_scale_aux * bal_gate_grad
                      + self.spectral_scale_aux * reinf_gate_grad
                      + self.spectral_scale_aux * l1_gate_grad
-                     + gate_rep_grad)
+                     + self.spectral_scale_aux * gate_rep_grad)
         
         # Homeostatic boost (if ls_var < 0.05)
         ls_mean = self.ls.mean(dim=-1)
