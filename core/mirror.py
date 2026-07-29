@@ -419,7 +419,7 @@ class GroupedCognitiveMirror(nn.Module):
             ls_dev = ls.mean(dim=-1) - ls.mean()
             ls_var = ls.var().item()
             if ls_var < 0.05:
-                boost = 0.3 * torch.sigmoid(3.0 * ls_dev)
+                boost = 1.0 * torch.sigmoid(3.0 * ls_dev)
                 gate_logits = gate_logits + boost.unsqueeze(0).unsqueeze(0)
 
         expert_gate = torch.sigmoid(gate_logits)

@@ -93,7 +93,7 @@ class WideBandConfig:
 
     accum_steps: int = 1
     compile: bool = False
-    div_weight: float = 0.087  # λ⁻⁴ push log_scale variance per-layer
+    div_weight: float = 0.3  # push log_scale variance per-layer (bypasses spectral alignment)
     ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (adaptive from here, scaled to 5% of CE)
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
 
