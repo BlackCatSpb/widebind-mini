@@ -48,7 +48,8 @@ class GroupedCognitiveMirror(nn.Module):
     def __init__(self, D, G=32, k=32, w_pred_scale_init=3.0, log_scale_init_std=0.05,
                  delta_var_ema_min=0.8, delta_var_ema_max=0.99, tie_mirror_proj=False,
                  layer_idx=0, n_layers=32, has_private_mem=False,
-                 expert_asymmetry=False, meta_trust=False):
+                 expert_asymmetry=False, meta_trust=False, gate_bias_scale=0.0,
+                 alpha_novelty_weight=0.0):
         super().__init__()
         assert D % G == 0
         self.D = D
@@ -116,6 +117,9 @@ class GroupedCognitiveMirror(nn.Module):
         self.w_gate = nn.Parameter(torch.randn(G, self.k) * gate_std)
         self.b_gate = nn.Parameter(torch.zeros(G))
         self.w_delta_gate = nn.Parameter(torch.randn(G, self.k) / math.sqrt(self.k))
+        gate_bias_val = torch.linspace(-gate_bias_scale, gate_bias_scale, G)
+        self.gate_bias = nn.Parameter(gate_bias_val)
+        self._alpha_novelty_weight = alpha_novelty_weight
 
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
         self._expert_asymmetry = expert_asymmetry
@@ -233,6 +237,17 @@ class GroupedCognitiveMirror(nn.Module):
                 relative_var = rv / (rv_mean + 1e-10)
                 alpha_target = torch.sigmoid(2.2 - torch.log(relative_var))
                 self.alpha_diag.data.lerp_(alpha_target, 0.01)
+                # Alpha novelty push: repulsive force across experts with adaptive gain
+                if self._alpha_novelty_weight > 0 and G > 1:
+                    alpha_per_expert = self.alpha_diag.mean(dim=-1)  # (G,)
+                    alpha_std = alpha_per_expert.std()
+                    boost = max(1.0, 0.1 / (alpha_std + 0.01))
+                    adapted_w = self._alpha_novelty_weight * boost
+                    alpha_center = alpha_per_expert - alpha_per_expert.mean()
+                    novelty_push = (adapted_w * 2
+                                    * alpha_center.unsqueeze(1).expand(-1, k) / G)
+                    self.alpha_diag.data.add_(novelty_push)
+                    self.alpha_diag.data.clamp_(0.01, 0.99)
         self._cached_pred_k = _pred_k_aux
         self._cached_hp = hp
         pred_error_norm = (raw_pred_error / hp_norm).norm(dim=(-2, -1))
@@ -395,6 +410,7 @@ class GroupedCognitiveMirror(nn.Module):
 
         gate_signal = torch.abs(pred_error)
         gate_logits = torch.einsum('blgk,gk->blg', gate_signal, self.w_gate) + self.b_gate
+        gate_logits = gate_logits + self.gate_bias.unsqueeze(0).unsqueeze(0)
         delta_gate = torch.einsum('blgk,gk->blg', delta, self.w_delta_gate)
         gate_logits = gate_logits + delta_gate
         gate_logits = gate_logits + grad_mod.unsqueeze(0).unsqueeze(0)

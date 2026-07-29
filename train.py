@@ -224,21 +224,24 @@ def train(cfg, data_dir, device):
             ce_grads = torch.autograd.grad(ce_loss / accum, model.parameters(),
                                            retain_graph=bool(aux_dict), allow_unused=True)
 
-            # Separate div loss from rest of aux (it fights CE, don't align spectrally)
-            div_loss = None
+            # Separate bypass losses from spectral alignment
+            # These fight CE or are heuristic — don't align them
+            bypass_keys = {'div', 'gate_repulse', 'alpha_novelty', 'ranking'}
+            bypass_losses = {k: None for k in bypass_keys}
             aligned_dict = {}
             if aux_dict:
                 for k, v in aux_dict.items():
-                    if k == 'div':
-                        div_loss = v
+                    if k in bypass_keys:
+                        bypass_losses[k] = v
                     elif isinstance(v, torch.Tensor) and v.requires_grad:
                         aligned_dict[k] = v
 
-            # Div gradient: applied directly without spectral alignment
-            div_grads = None
-            if div_loss is not None:
-                div_grads = torch.autograd.grad(
-                    div_loss / accum, model.parameters(), allow_unused=True)
+            # Bypass gradients: applied directly without spectral alignment
+            bypass_grads = {}
+            for k, v in bypass_losses.items():
+                if v is not None:
+                    bypass_grads[k] = torch.autograd.grad(
+                        v / accum, model.parameters(), allow_unused=True)
 
             # Spectral gradient alignment for non-div aux losses
             if aligned_dict:
@@ -260,7 +263,7 @@ def train(cfg, data_dir, device):
                 aux_grads = None
                 scale = 0.0
 
-            # Combine: g = g_CE + scale * g_aligned + g_div
+            # Combine: g = g_CE + scale * g_aligned + sum(bypass_grads)
             with torch.no_grad():
                 for p, cg in zip(model.parameters(), ce_grads):
                     if cg is not None:
@@ -273,12 +276,14 @@ def train(cfg, data_dir, device):
                             p.grad.add_(ag, alpha=scale)
                         elif ag is not None:
                             p.grad = ag * scale
-                if div_grads is not None:
-                    for p, dg in zip(model.parameters(), div_grads):
-                        if p.grad is not None and dg is not None:
-                            p.grad.add_(dg)
-                        elif dg is not None:
-                            p.grad = dg.clone()
+                for gname, bgrads in bypass_grads.items():
+                    if bgrads is not None:
+                        for p, bg in zip(model.parameters(), bgrads):
+                            if bg is not None:
+                                if p.grad is not None:
+                                    p.grad.add_(bg)
+                                else:
+                                    p.grad = bg.clone()
             
             # Adaptive phase scaling: EMA-based mirror/base gradient balance
             # mirror_scale = sigmoid((ratio - ratio_ema) / (ratio_std + 1e-8))
@@ -397,7 +402,7 @@ if __name__ == '__main__':
     parser.add_argument('--eval-interval', type=int, default=500, help='Eval every N steps')
     parser.add_argument('--save-interval', type=int, default=2000, help='Save every N steps')
     parser.add_argument('--compile', action='store_true', help='Enable torch.compile (~30% tok/s)')
-    parser.add_argument('--div-weight', type=float, default=0.087, help='Expert diversity loss weight (pushes var(log_scale) up)')
+    parser.add_argument('--div-weight', type=float, default=None, help='Expert diversity loss weight (pushes var(log_scale) up)')
     parser.add_argument('--private-mem', action='store_true', help='Enable cross-expert private memory bank')
     parser.add_argument('--aux-mirror-weight', type=float, default=0.0, help='External mirror loss weight (0=off)')
     parser.add_argument('--no-expert-asymmetry', action='store_true', help='Disable asymmetric expert init')
@@ -408,31 +413,25 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='cuda', help='Device (cuda/cpu)')
     args = parser.parse_args()
 
-    cfg = WideBandConfig(
-        D=args.D,
-        n_layers=args.n_layers,
-        mlp_groups=args.mlp_groups,
-        mlp_expand=args.mlp_expand,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        max_steps=args.max_steps,
-        eval_interval=args.eval_interval,
-        save_interval=args.save_interval,
+    cfg_kw = dict(
+        D=args.D, n_layers=args.n_layers,
+        mlp_groups=args.mlp_groups, mlp_expand=args.mlp_expand,
+        seq_len=args.seq_len, batch_size=args.batch_size,
+        lr=args.lr, max_steps=args.max_steps,
+        eval_interval=args.eval_interval, save_interval=args.save_interval,
         lambda_d_enabled=not args.no_lambda,
         bind_twist_mode=args.bind_twist_mode,
-        data_dir=args.data_dir,
-        save_dir=args.save_dir,
-        grad_clip=0.5,
-        conv_kernel=48,
-        accum_steps=args.accum,
-        compile=args.compile,
-        div_weight=args.div_weight,
+        data_dir=args.data_dir, save_dir=args.save_dir,
+        grad_clip=0.5, conv_kernel=48,
+        accum_steps=args.accum, compile=args.compile,
         private_mem=args.private_mem,
         aux_mirror_weight=args.aux_mirror_weight,
         expert_asymmetry=not args.no_expert_asymmetry,
         meta_trust=not args.no_meta_trust,
     )
+    if args.div_weight is not None:
+        cfg_kw['div_weight'] = args.div_weight
+    cfg = WideBandConfig(**cfg_kw)
 
     device = args.device if torch.cuda.is_available() else 'cpu'
     train(cfg, args.data_dir, device)

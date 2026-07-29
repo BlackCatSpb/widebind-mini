@@ -93,8 +93,12 @@ class WideBandConfig:
 
     accum_steps: int = 1
     compile: bool = False
-    div_weight: float = 0.3  # push log_scale variance per-layer (bypasses spectral alignment)
-    ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (adaptive from here, scaled to 5% of CE)
+    div_weight: float = 50.0  # push log_scale variance via -var(sigmoid(ls)) (bounded, self-limiting)
+    ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (bypasses spectral alignment)
+    gate_repulse_weight: float = 0.3  # push gate variance up (inverse of balance, bypasses spectral)
+    alpha_novelty_weight: float = 0.05  # push per-expert alpha apart (heuristic, no spectral)
+    gate_bias_scale: float = 2.0  # linspace init for gate bias per expert [-scale, scale]
+    gate_bias_scale_per_layer: bool = True  # 0.5 (first layer) -> 2.0 (last)
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
 
     # ─── Spec 1: Asymmetric expert init ───

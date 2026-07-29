@@ -41,7 +41,9 @@ class WideBindBlock(nn.Module):
             layer_idx=layer_idx, n_layers=cfg.n_layers,
             has_private_mem=cfg.private_mem,
             expert_asymmetry=cfg.expert_asymmetry,
-            meta_trust=cfg.meta_trust)
+            meta_trust=cfg.meta_trust,
+            gate_bias_scale=0.5 + 1.5 * layer_idx / max(cfg.n_layers - 1, 1) if getattr(cfg, 'gate_bias_scale_per_layer', False) else cfg.gate_bias_scale,
+            alpha_novelty_weight=cfg.alpha_novelty_weight)
 
         self._n_scales = 4
         tau_s = torch.tensor([8, 32, 128, 512], dtype=torch.float32)
