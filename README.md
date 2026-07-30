@@ -31,14 +31,20 @@ WideBind строится на трёх слоях:
 ## 2. Архитектура модели
 
 ```
-token IDs → PartitionedEmbedding (8×112, sparse 6/32) → [WideBindBlock × 12] → Final RMS Norm → PartitionedHead → logits
+token IDs → PartitionedEmbedding (8×112, sparse 6/32) + RoPE (θ=1e6) → [WideBindBlock × 12] → Final RMS Norm → PartitionedHead → logits
 ```
 
 Каждый блок:
 
 ```
-h → RMSNorm → Conv1d(groups=D, k=48) → BottleneckBind(D→K=32→D) → VSA Memory (chunked scan) → GroupedCognitiveMirror (8 экспертов) → DCT Spectral → GroupedMLP (8 групп, ×4)
+h → RMSNorm → Conv1d(groups=D, k=48) → BottleneckBind(D→K=32→D, QK-RMSNorm) → VSA Memory (chunked scan) → GroupedCognitiveMirror (8 экспертов) → DCT Spectral → GroupedMLP (8 групп, ×4, SwiGLU)
 ```
+
+### 2.0 RoPE (Rotary Position Embedding)
+
+После PartitionedEmbedding на каждый токен применяется RoPE с θ=1e6 (Qwen3-style): вращение пар половинок размерности по позиции токена. 0 дополнительных параметров, lazy cache для произвольной длины контекста.
+
+RoPE ортогонален VSA memory (аддитивный VSA vs вращательный RoPE) — не конфликтует, даёт модели позиционный сигнал без self-attention.
 
 ### 2.1 BottleneckBind — межканальное скрещивание
 
@@ -49,6 +55,8 @@ h → RMSNorm → Conv1d(groups=D, k=48) → BottleneckBind(D→K=32→D) → VS
 - **cascade**: Фибоначчи-вложенные моночлены
 
 `tie_bind=True`: W_out = W_proj^T (автоэнкодерная структура). w_u/v с std=1.0 (критичен для градиента).
+
+**QK-RMSNorm** (Qwen3-style): RMSNorm(K=32) на `hp` перед cross-операциями — фиксирует ‖hp‖=√K, градиент не взрывается и не затухает через узкое горлышко K=32. ~0 параметров (2K=64 с elementwise_affine).
 
 ### 2.2 VSA Memory — мультимасштабная векторная суперпозиция
 
@@ -194,27 +202,41 @@ gate_logits = |pred_error| @ w_gate          # Layer 0: "я не знаю это
 `w_contra[g]` — learnable per-expert bias. Init +0.01: disagreement открывает gate
 («когда я противоречу коллективу — доверяй внешнему сигналу»).
 
-### 2.8 GroupedMLP — Feed-Forward
+### 2.8 GroupedMLP — Feed-Forward (SwiGLU)
 
-8 групп × (112 → 448 → 112, SiLU). 79.6% всех параметров.
+8 групп × SwiGLU(112 → 448 → 112). 75.6% всех параметров.
+
+SwiGLU (Qwen3-style): `silu(W_gate(x)) * W_up(x)` — разделение ответственности:
+gate решает **ЧТО** пропускать, up — **В КАКОМ НАПРАВЛЕНИИ**.
+
+```python
+gate = SiLU(einsum('blgd,gdf->blgf', h, W_gate))  # d → expand·d
+up   = einsum('blgd,gdf->blgf', h, W_up)           # d → expand·d
+h = gate * up
+h = einsum('blgf,gfd->blgd', h, W_down)            # expand·d → d
+```
+
+Per-group: 3 · 112 · 448 = 150,528 (vs 2 · 112 · 448 = 100,352 regular MLP). +50% за выразительность.
 Параметры модулируются per-expert usefulness от mirror.
 
 ---
 
-## 3. Параметры (D=896, L=12, G=8, bind_twist_mode=shift)
+## 3. Параметры (D=896, L=12, G=8, bind_twist_mode=shift, SwiGLU)
 
 | Компонент | Параметров | % |
 |-----------|-----------|----|
-| Embed + LM Head | 51,920 | 0.42 |
-| BottleneckBind (K=32, S=4 multi-ocular) | 1,723,776 | 13.96 |
-| GroupedCognitiveMirror (staircase k=8/16/32) | 239,612 | 1.91 |
-| Conv1d (k=48, groups=D) | 521,472 | 4.15 |
-| DCT Spectral (λ_k × D) | 10,752 | 0.09 |
-| VSA Gates + Multi-scale (w_i, w_q, scale_w, w_q_dyn, w_i_dyn, w_d_pen, w_bind_gate) | 562,892 | 4.41 |
-| GroupedMLP (expand=4) | 9,644,640 | 75.65 |
-| **Total** | **~12.75M** | **100** |
+| Embed + LM Head | 51,920 | 0.29 |
+| BottleneckBind (K=32, S=4 multi-ocular, QK-RMSNorm) | 1,723,840 | 9.76 |
+| GroupedCognitiveMirror (staircase k=8/16/32) | 239,612 | 1.36 |
+| Conv1d (k=48, groups=D) | 521,472 | 2.95 |
+| DCT Spectral (λ_k × D) | 10,752 | 0.06 |
+| VSA Gates + Multi-scale | 562,892 | 3.19 |
+| RoPE | 0 | 0.00 |
+| GroupedMLP (expand=4, **SwiGLU**) | 14,467,584 | 81.86 |
+| **Total** | **~17.67M** | **100** |
 
-При `--bind-twist-mode off`: BottleneckBind → 689,280 (S=1, tied), total ~11.20M.
+При `mlp_swiglu=False, bind_qk_norm=False`: MLP → 9,644,640 (regular), total ~12.85M.
+При `--bind-twist-mode off`: BottleneckBind → 689,280 (S=1, tied), total ~16.02M.
 
 ---
 
