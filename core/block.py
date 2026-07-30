@@ -222,9 +222,7 @@ class WideBindBlock(nn.Module):
             chunks.append((intra, final, cum_decay))
 
         mem_all_vec, mem_state_out_vec, mem_leaf_vec = _combine_chunks(chunks, mem_state_f32)
-        mem_all_vec = mem_all_vec.to(_dtype)
-        mem_state_out_vec = mem_state_out_vec.to(_dtype)
-        mem_leaf_vec = mem_leaf_vec.to(_dtype)
+        # Keep VSA in fp32 — prefix scan accumulators underflow/overflow in fp16
 
         mem_all_vec = mem_all_vec.view(B, L, S, D)
         mem_leaf_vec = mem_leaf_vec.view(B, L, S, D)
@@ -238,13 +236,14 @@ class WideBindBlock(nn.Module):
         if mu_state is not None:
             mu_state = mu_state.reshape(B, S * D)
         mu_input_vec = (mem_input * self.w_k_mu).unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
+        mu_input_f32 = mu_input_vec.float()
         mu_chunks = []
         for start in range(0, L, CHUNK):
             end = min(start + CHUNK, L)
-            intra, final, cum_decay = _scan_chunk(mu_input_vec[:, start:end], decay[:, start:end])
+            intra, final, cum_decay = _scan_chunk(mu_input_f32[:, start:end], decay_f32[:, start:end])
             mu_chunks.append((intra, final, cum_decay))
         mu_all_vec, mu_state_out_vec, _ = _combine_chunks(mu_chunks, mu_state)
-        mu_all_vec = mu_all_vec.view(B, L, S, D)
+        mu_all_vec = mu_all_vec.view(B, L, S, D)  # keep fp32
         mu_all = (mu_all_vec * w.unsqueeze(0).unsqueeze(0)).sum(dim=2)
         mu_read = mu_all * self.w_q_mu
         mem_read = mem_read + mu_read * self.w_mu_mem
