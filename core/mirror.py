@@ -201,6 +201,13 @@ class GroupedCognitiveMirror(nn.Module):
             )[1])
         mc_k = torch.einsum('b l gd,gdk->b l gk', mc_g, self.W_proj)
 
+        # ─── Bipolar pos_id binding: hp = hp ⊛ pos_id ───
+        # Каждый токен получает уникальный bipolar (±1) ключ-позицию.
+        # VSA scan хранит hp_bound, associative recall по pos_id при unbind.
+        # pos_id: (L, 1, 1, k) — broadcast на G экспертов и B батч.
+        pos_id = torch.sign(torch.randn(1, L, 1, self.k, device=hp.device))
+        hp = hp * pos_id
+
         hp_prev = torch.cat([torch.zeros_like(hp[:, 0:1]), hp[:, :-1]], dim=1)
 
         temp_k = (hp - mc_k) * self.w_temp

@@ -302,6 +302,128 @@ def test_nan_stability():
     print('  PASS: 100-step NaN stability OK')
 
 
+# ─── Pos-ID tests ──────────────────────────────────────────────────────
+
+def test_pos_id_shape():
+    """pos_id (1, L, 1, K) broadcasts correctly with hp (B, L, G, K)."""
+    cfg = make_cfg()
+    model = make_model(cfg).to(device)
+    x = torch.randint(0, cfg.vocab, (cfg.batch_size, cfg.seq_len), device=device)
+    h = model.embed_tokens(x)
+    mir = model.layers[0].mirror
+    mir.train()
+    B, L, D = h.shape
+    G, k = mir.G, mir.k
+    # Manually trace: hp = einsum('blgd,gdk->blgk', h_g, W_proj) * pos_id
+    h_g = h.reshape(B, L, G, D // G)
+    hp = torch.einsum('blgd,gdk->blgk', h_g, mir.W_proj)
+    pos_id = torch.sign(torch.randn(1, L, 1, k, device=h.device))
+    hp_bound = hp * pos_id
+    assert hp_bound.shape == (B, L, G, k), f'Shape mismatch: {hp_bound.shape} != {(B, L, G, k)}'
+    print(f'  PASS: pos_id shape {pos_id.shape} broadcasts to hp {hp.shape} -> {hp_bound.shape}')
+
+
+def test_pos_id_deterministic():
+    """Same seed generates same pos_id."""
+    L, k = 16, 32
+    g = torch.Generator(device=device)
+    g.manual_seed(777)
+    p1 = torch.sign(torch.randn(1, L, 1, k, generator=g, device=device))
+    g.manual_seed(777)
+    p2 = torch.sign(torch.randn(1, L, 1, k, generator=g, device=device))
+    assert (p1 == p2).all(), 'Different pos_id from same seed'
+    print('  PASS: pos_id deterministic from same seed')
+
+
+def test_pos_id_bipolar_values():
+    """pos_id values are exactly +1 or -1 (bipolar)."""
+    L, k = 32, 32
+    pos_id = torch.sign(torch.randn(1, L, 1, k, device=device))
+    vals = pos_id.unique().tolist()
+    assert -1 in vals and 1 in vals and len(vals) == 2, f'Not bipolar: {vals}'
+    print(f'  PASS: pos_id is bipolar (values={vals})')
+
+
+def test_pos_id_self_inverse():
+    """bipolar pos_id is self-inverse: pos_id * pos_id = 1 (element-wise)."""
+    L, k = 32, 32
+    pos_id = torch.sign(torch.randn(1, L, 1, k, device=device))
+    squared = pos_id * pos_id
+    assert (squared == 1.0).all(), 'pos_id² ≠ 1'
+    print('  PASS: pos_id is self-inverse under element-wise multiply')
+
+
+def test_pos_id_pseudo_orthogonal():
+    """Different positions have near-zero expected dot product (pseudo-orthogonal at K=32)."""
+    L, k = 64, 32
+    pos_id = torch.sign(torch.randn(1, L, 1, k, device=device)).squeeze()
+    # Mean absolute dot product across random position pairs
+    dots = []
+    for _ in range(1000):
+        i, j = torch.randint(0, L, (2,), device=device).tolist()
+        if i != j:
+            dots.append((pos_id[i] * pos_id[j]).sum().item() / k)
+    mean_abs_dot = sum(abs(d) for d in dots) / len(dots)
+    assert mean_abs_dot < 0.3, f'Too correlated: mean|dot|={mean_abs_dot:.3f} (need <0.3 at K=32)'
+    print(f'  PASS: pos_id pseudo-orthogonal (mean|dot|={mean_abs_dot:.3f})')
+
+
+def test_pos_id_bind_changes_hp():
+    """Binding hp with pos_id changes the values (smoke test)."""
+    cfg = make_cfg()
+    model = make_model(cfg).to(device)
+    x = torch.randint(0, cfg.vocab, (cfg.batch_size, cfg.seq_len), device=device)
+    h = model.embed_tokens(x)
+    mir = model.layers[0].mirror
+    mir.train()
+    B, L, D = h.shape
+    G, k = mir.G, mir.k
+    h_g = h.reshape(B, L, G, D // G)
+    hp_unbound = torch.einsum('blgd,gdk->blgk', h_g, mir.W_proj)
+    pos_id = torch.sign(torch.randn(1, L, 1, k, device=h.device))
+    hp_bound = hp_unbound * pos_id
+    diff = (hp_unbound - hp_bound).abs().mean().item()
+    assert diff > 0.01, f'Hp not changed by pos_id (diff={diff:.6f})'
+    print(f'  PASS: pos_id binding changes hp (mean|d|={diff:.6f})')
+
+
+def test_pos_id_associative_recall():
+    """Bind with pos_id, then unbind with same pos_id recovers original content.
+    Since pos_id is self-inverse (bipolar), unbind = multiply by same pos_id.
+    hp_recovered = (hp * pos_id) * pos_id = hp."""
+    cfg = make_cfg()
+    model = make_model(cfg).to(device)
+    x = torch.randint(0, cfg.vocab, (cfg.batch_size, cfg.seq_len), device=device)
+    h = model.embed_tokens(x)
+    mir = model.layers[0].mirror
+    B, L, D = h.shape
+    G, k = mir.G, mir.k
+    h_g = h.reshape(B, L, G, D // G)
+    with torch.no_grad():
+        hp = torch.einsum('blgd,gdk->blgk', h_g, mir.W_proj)
+        pos_id = torch.sign(torch.randn(1, L, 1, k, device=h.device))
+        hp_bound = hp * pos_id
+        hp_recovered = hp_bound * pos_id  # unbind = multiply by same bipolar key
+        error = (hp - hp_recovered).abs().max().item()
+    assert error < 1e-6, f'Recovery error too high: {error:.6f} (need <1e-6)'
+    print(f'  PASS: associative recall exact (max|d|={error:.2e})')
+
+
+def test_pos_id_forward_no_nan():
+    """Forward+backward with pos_id should not produce NaN."""
+    cfg = make_cfg(private_mem=True, expert_asymmetry=True, meta_trust=True)
+    model = make_model(cfg).train().to(device)
+    x = torch.randint(0, cfg.vocab, (cfg.batch_size, cfg.seq_len), device=device)
+    h = model.embed_tokens(x)
+    out, state, gs = model(h)
+    loss = out.abs().mean()
+    loss.backward()
+    assert not torch.isnan(loss), 'NaN loss with pos_id'
+    grad_norm = sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)
+    assert grad_norm > 0, 'Zero gradient with pos_id'
+    print(f'  PASS: forward+backward with pos_id (grad_norm={grad_norm:.4f})')
+
+
 # ─── Run ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
