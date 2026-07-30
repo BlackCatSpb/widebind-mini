@@ -105,13 +105,13 @@ class WideBindBlock(nn.Module):
         device = h.device
         if hasattr(self.mirror, '_cached_pred_error_norm') and self.mirror._cached_pred_error_norm is not None:
             pen = self.mirror._cached_pred_error_norm
-            if pen.shape[-1] != L:
+            if pen.shape[-1] != L or pen.shape[0] != B:
                 self.mirror._cached_pred_error_norm = None
             else:
                 self.mirror._cached_pred_error_norm = pen.detach().to(device=device, dtype=h.dtype)
         if hasattr(self.mirror, '_cached_hp') and self.mirror._cached_hp is not None:
             hp = self.mirror._cached_hp
-            if hp.shape[1] != L:
+            if hp.shape[1] != L or hp.shape[0] != B:
                 self.mirror._cached_hp = None
             else:
                 self.mirror._cached_hp = hp.detach().to(device=device, dtype=h.dtype)
