@@ -108,13 +108,13 @@ class WideBindBlock(nn.Module):
             if pen.shape[-1] != L:
                 self.mirror._cached_pred_error_norm = None
             else:
-                self.mirror._cached_pred_error_norm = pen.detach().to(device)
+                self.mirror._cached_pred_error_norm = pen.detach().to(device=device, dtype=h.dtype)
         if hasattr(self.mirror, '_cached_hp') and self.mirror._cached_hp is not None:
             hp = self.mirror._cached_hp
             if hp.shape[1] != L:
                 self.mirror._cached_hp = None
             else:
-                self.mirror._cached_hp = hp.detach().to(device)
+                self.mirror._cached_hp = hp.detach().to(device=device, dtype=h.dtype)
 
         def _chk(t, label):
             if t.is_floating_point() and (t.isnan().any() or t.isinf().any()):
@@ -153,7 +153,7 @@ class WideBindBlock(nn.Module):
         if hasattr(mir, '_cached_pred_error_norm') and mir._cached_pred_error_norm is not None:
             pen = mir._cached_pred_error_norm
             d_pen_factor = 1.0 - 0.5 * torch.sigmoid(pen.unsqueeze(-1) + self.w_d_pen.unsqueeze(0).unsqueeze(0))
-            d_mod = (d_mod.reshape(B, L, self.mirror.G, self.mirror.d) * d_pen_factor.unsqueeze(-1)).reshape(B, L, D)
+            d_mod = (d_mod.reshape(B, L, self.mirror.G, self.mirror.d) * d_pen_factor.to(d_mod.dtype).unsqueeze(-1)).reshape(B, L, D)
 
         if noise_scale > 0 and self.training:
             noise = 1.0 + noise_scale * torch.randn_like(i_gate)
