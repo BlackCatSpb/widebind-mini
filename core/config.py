@@ -91,6 +91,12 @@ class WideBandConfig:
     bind_twist_scheme: str = "golden"    # "golden" | "fibonacci"
     bind_twist_gate: bool = False        # per-token adaptive aperture via hp
 
+    # ─── Qwen3-inspired upgrades ───
+    bind_qk_norm: bool = True            # RMSNorm on hp before bottleneck cross (≈QK-Norm)
+    rope_theta: float = 1000000.0        # RoPE base frequency (Qwen3: 1e6)
+    rope_scaling: float = 1.0            # RoPE scaling factor (linear)
+    mlp_swiglu: bool = True              # SwiGLU gate_proj parallel to up_proj (Qwen3-style)
+
     accum_steps: int = 1
     compile: bool = False
     div_weight: float = 50.0  # push log_scale variance via -var(sigmoid(ls)) (bounded, self-limiting)

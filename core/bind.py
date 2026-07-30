@@ -71,6 +71,10 @@ class BottleneckBind(nn.Module):
 
         self.w_bind_bias = nn.Parameter(torch.zeros(K))
         self.W_proj = nn.Linear(D, K, bias=False)
+        if getattr(cfg, "bind_qk_norm", False):
+            self.hp_norm = nn.RMSNorm(K)
+        else:
+            self.hp_norm = nn.Identity()
 
         shifts = _golden_shifts(K, self.S) if scheme == "golden" else _fibonacci_shifts(K, self.S)
         self.register_buffer("shifts", torch.tensor(shifts, dtype=torch.long), persistent=False)
@@ -109,7 +113,7 @@ class BottleneckBind(nn.Module):
         return left * torch.roll(right, shifts=int(shift), dims=-1)
 
     def forward(self, h):
-        hp = self.W_proj(h) + self.w_bind_bias
+        hp = self.hp_norm(self.W_proj(h) + self.w_bind_bias)
         if self.gated:
             g = torch.sigmoid(self.w_gate_proj(hp)).unsqueeze(-1)
         else:

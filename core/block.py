@@ -88,7 +88,8 @@ class WideBindBlock(nn.Module):
         lam = torch.full((cfg.D,), base) + per_dim
         self.lambda_k = nn.Parameter(lam)
 
-        self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups)
+        self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups,
+                              swiglu=getattr(cfg, 'mlp_swiglu', True))
 
     def forward(self, h, state=None, global_state=None,
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,
