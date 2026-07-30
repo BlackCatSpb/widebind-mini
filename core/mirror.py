@@ -308,8 +308,8 @@ class GroupedCognitiveMirror(nn.Module):
                 contra_expert = contra_g.mean(dim=-1)
                 self._cached_contra_expert = contra_expert
                 sim_vals = concept_sim[~torch.eye(self.G, dtype=torch.bool, device=concept_sim.device)]
-                q_hi = sim_vals.quantile(0.75)
-                q_lo = sim_vals.quantile(0.25)
+                q_hi = sim_vals.float().quantile(0.75)
+                q_lo = sim_vals.float().quantile(0.25)
                 self._cached_concept_dendrogram = (q_hi.item(), q_lo.item())
                 dominance = self._trust_matrix.sum(dim=0)
                 isolation = 1.0 - (self._trust_matrix.sum(dim=-1) / self.G)
