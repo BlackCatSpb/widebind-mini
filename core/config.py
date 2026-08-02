@@ -116,6 +116,18 @@ class WideBandConfig:
     # ─── Spec 3: Recursive meta-trust ───
     meta_trust: bool = True  # track trust dynamics, penalize unstable experts (requires private_mem)
 
+    # ─── Spec 4: Collective Concept Layer (experimental) ───
+    collective_layer: bool = False
+    collective_layer_idx: int = 6      # Mini: L6 (Main: L11)
+    collective_S: int = 8              # shared slots
+    collective_write_delay: int = 5000 # like private_mem
+    collective_uncert_theta: float = 0.5
+    collective_uncert_kappa: float = 3.0
+    collective_contra_thresh: float = -0.1
+    collective_contra_gain: float = 6.0
+    collective_birth_gap: float = 0.55
+    collective_maturity_thresh: float = 0.12  # mirror resvar EMA below -> layer mature
+
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
 
     max_steps: int = 300000

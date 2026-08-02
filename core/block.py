@@ -9,6 +9,7 @@ from .vsa_utils import dct_basis, fib_sigmoid_init
 from .bind import BottleneckBind
 from .mirror import GroupedCognitiveMirror
 from .mlp import GroupedMLP
+from .concept_layer import CollectiveConceptLayer
 
 
 class WideBindBlock(nn.Module):
@@ -90,6 +91,17 @@ class WideBindBlock(nn.Module):
 
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups,
                               swiglu=getattr(cfg, 'mlp_swiglu', True))
+
+        self.collective = None
+        if getattr(cfg, 'collective_layer', False) and layer_idx == getattr(cfg, 'collective_layer_idx', 6):
+            self.collective = CollectiveConceptLayer(
+                cfg.D, k=k, S=getattr(cfg, 'collective_S', 8),
+                write_delay=getattr(cfg, 'collective_write_delay', 5000),
+                uncert_theta=getattr(cfg, 'collective_uncert_theta', 0.5),
+                uncert_kappa=getattr(cfg, 'collective_uncert_kappa', 3.0),
+                contra_thresh=getattr(cfg, 'collective_contra_thresh', -0.1),
+                contra_gain=getattr(cfg, 'collective_contra_gain', 6.0),
+                birth_gap=getattr(cfg, 'collective_birth_gap', 0.55))
 
     def forward(self, h, state=None, global_state=None,
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,
@@ -273,6 +285,17 @@ class WideBindBlock(nn.Module):
         bind_gated = (bind_out.reshape(B, L, g, d) * mm * bind_gate.unsqueeze(-1)).reshape(B, L, D)
         enhanced_base = bind_gated + mem_modulated * self.w_mem2v * mem2v_scale
         enhanced = enhanced_base + mirror
+        if self.collective is not None:
+            hp_c = self.mirror._cached_hp
+            pen = self.mirror._cached_pred_error_norm
+            if hp_c is not None and pen is not None:
+                if pen.shape[0] != B or pen.shape[1] != L:
+                    pen = pen.new_zeros(B, L)
+                rv = self.mirror._residual_var_ema.mean().item()
+                col_write = (self.training if allow_write is None else allow_write)
+                concept_out = self.collective(h, hp_c, pen, resvar=rv,
+                                              allow_write=col_write)
+                enhanced = enhanced + concept_out
         if _chk(enhanced, 'enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         self._cache_bind_out = enhanced_base
         self._cache_mirror_out = mirror

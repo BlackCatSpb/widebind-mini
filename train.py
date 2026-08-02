@@ -335,10 +335,18 @@ def train(cfg, data_dir, device):
                 # Individual aux losses from compute_loss cache
                 lc = getattr(model, '_cached_losses', {})
                 aux_str = ' '.join(f'{k}={v:.4f}' for k, v in lc.items())
+                col_str = ''
+                for l in model.layers:
+                    if getattr(l, 'collective', None) is not None:
+                        cd = l.collective.debug()
+                        col_str = (f' | col: mature={cd["mature"]:.2f} '
+                                   f'u={cd["u_gate"]:.3f} c={cd["c_gate"]:.3f} '
+                                   f'scale={cd["read_scale"]:.3f} occ={cd["occupied"]}/{len(cd["U_s"])} '
+                                   f'U={cd["U_s"]}')
                 print(f'step={step:>6} loss={ce_loss.item():.4f} |1-a|={idiff:.4f} '
                       f'g_var={gvar:.4f} ls_var={ls_var:.4f} lr={lr:.2e} tok/s={tokens/dt:.0f} '
                       f'ms={mean_mirror_scale:.3f} mr={mean_ratio:.4f} '
-                      f'mem={mem_gb:.2f}GB | {aux_str}')
+                      f'mem={mem_gb:.2f}GB{col_str} | {aux_str}')
                 if device == 'cuda':
                     torch.cuda.reset_peak_memory_stats()
 
@@ -406,6 +414,8 @@ if __name__ == '__main__':
     parser.add_argument('--compile', action='store_true', help='Enable torch.compile (~30% tok/s)')
     parser.add_argument('--div-weight', type=float, default=None, help='Expert diversity loss weight (pushes var(log_scale) up)')
     parser.add_argument('--private-mem', action='store_true', help='Enable cross-expert private memory bank')
+    parser.add_argument('--collective-layer', action='store_true', help='Enable collective concept layer (experimental)')
+    parser.add_argument('--collective-write-delay', type=int, default=None, help='Overrides collective write delay (for testing)')
     parser.add_argument('--aux-mirror-weight', type=float, default=0.0, help='External mirror loss weight (0=off)')
     parser.add_argument('--no-expert-asymmetry', action='store_true', help='Disable asymmetric expert init')
     parser.add_argument('--no-meta-trust', action='store_true', help='Disable meta-trust instability penalty')
@@ -427,12 +437,15 @@ if __name__ == '__main__':
         grad_clip=0.5, conv_kernel=48,
         accum_steps=args.accum, compile=args.compile,
         private_mem=args.private_mem,
+        collective_layer=args.collective_layer,
         aux_mirror_weight=args.aux_mirror_weight,
         expert_asymmetry=not args.no_expert_asymmetry,
         meta_trust=not args.no_meta_trust,
     )
     if args.div_weight is not None:
         cfg_kw['div_weight'] = args.div_weight
+    if args.collective_write_delay is not None:
+        cfg_kw['collective_write_delay'] = args.collective_write_delay
     cfg = WideBandConfig(**cfg_kw)
 
     device = args.device if torch.cuda.is_available() else 'cpu'
