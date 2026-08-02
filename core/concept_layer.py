@@ -98,9 +98,6 @@ class CollectiveConceptLayer(nn.Module):
     def _maybe_write(self, hp, pen, allow_write):
         """Mature-gated, confident+novel slot refinement and birth."""
         self._step += 1
-        m = self._resvar_ref
-        if m.item() == 0.0:
-            self._resvar_ref.fill_(1.0)  # placeholder; set externally from mirror
         if self._step.item() < self._write_delay:
             return
         if not allow_write:
@@ -138,6 +135,12 @@ class CollectiveConceptLayer(nn.Module):
             idx = empty[0].item()
             self.M.data[idx] = F.normalize(shared[novel].mean(dim=0), dim=-1)
             self.N_s[idx] += 1
+        elif empty.numel() == 0 and novel.any():
+            # eviction: bank full -> least-used slot gets recycled for the novel concept
+            evict = int(torch.argmin(self.U_s).item())
+            self.M.data[evict] = F.normalize(shared[novel].mean(dim=0), dim=-1)
+            self.N_s[evict] = 1
+            self.U_s[evict] = 0.0
 
         # occupancy EMA
         occ = torch.zeros(self.S)
