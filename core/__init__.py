@@ -12,5 +12,6 @@ from .vsa_utils import (
     sparse_block_codes, vsa_prefix_scan,
 )
 from .zeckendorf_readout import ZeckendorfReadout
+from .sigmoid_head import SigmoidCodedHead
 
 CognitiveMirror = GroupedCognitiveMirror

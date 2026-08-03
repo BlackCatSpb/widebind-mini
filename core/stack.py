@@ -8,6 +8,7 @@ from .config import WideBindConfig
 from .embedding import PartitionedEmbedding, PartitionedHead
 from .block import WideBindBlock
 from .zeckendorf_readout import ZeckendorfReadout
+from .sigmoid_head import SigmoidCodedHead
 
 
 class AdaptiveController:
@@ -128,8 +129,11 @@ class WideBindStack(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.embed = PartitionedEmbedding(cfg)
+        head_mode = getattr(cfg, 'head_mode', 'partitioned')
         if getattr(cfg, 'zeckendorf_readout', False):
             self.lm_head = ZeckendorfReadout(cfg)
+        elif head_mode == 'sigmoid_coded':
+            self.lm_head = SigmoidCodedHead(cfg, embed_basis=self.embed.basis)
         else:
             self.lm_head = PartitionedHead(cfg, embed_basis=self.embed.basis)
 
@@ -276,26 +280,38 @@ class WideBindStack(nn.Module):
         ce_loss, _ = self.compute_losses(h, targets, pred_weight=pred_weight)
         return ce_loss
 
+    def _finalize_ce(self, ce, targets):
+        """Mask PAD/EOS и применить surprisal-weighting (единый хвост CE)."""
+        mask = (targets.reshape(-1) != 0) & (targets.reshape(-1) != 2)
+        ce_m = ce * mask.float()
+        sw = getattr(self.cfg, 'surprisal_weight', 0.0)
+        if self.training and sw > 0:
+            with torch.no_grad():
+                ce_ratio = ce_m / (ce_m.mean() + 1e-8)
+                w = torch.sigmoid(2.0 * (ce_ratio - 1.0))
+            ce_loss = (ce_m * w).sum() / mask.sum().clamp(min=1)
+        else:
+            ce_loss = ce_m.sum() / mask.sum().clamp(min=1)
+        return ce_loss
+
     def compute_losses(self, h, targets, pred_weight=None):
         if isinstance(self.lm_head, ZeckendorfReadout):
             B, L, D = h.shape
             log_probs = self.lm_head.log_probs_for_target(
                 h.reshape(-1, D), targets.reshape(-1))
-            ce_loss = -log_probs.mean()
+            ce = -log_probs.reshape(-1)
+            ce_loss = self._finalize_ce(ce, targets)
+        elif hasattr(self.lm_head, 'log_probs_for_target'):
+            # SigmoidCodedHead: точный per-target log P за O(K), без
+            # материализации/softmax-нормализации по V.
+            logp = self.lm_head.log_probs_for_target(h, targets)  # (B, L)
+            ce = -logp.reshape(-1)
+            ce_loss = self._finalize_ce(ce, targets)
         else:
             logits = self.lm_head(h)
             ce = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
                                  targets.reshape(-1), reduction='none')
-            mask = (targets.reshape(-1) != 0) & (targets.reshape(-1) != 2)
-            ce = ce * mask.float()
-            sw = getattr(self.cfg, 'surprisal_weight', 0.0)
-            if self.training and sw > 0:
-                with torch.no_grad():
-                    ce_ratio = ce / (ce.mean() + 1e-8)
-                    w = torch.sigmoid(2.0 * (ce_ratio - 1.0))
-                ce_loss = (ce * w).sum() / mask.sum().clamp(min=1)
-            else:
-                ce_loss = ce.sum() / mask.sum().clamp(min=1)
+            ce_loss = self._finalize_ce(ce, targets)
 
         pred_loss = 0.0
         n_pred = 0

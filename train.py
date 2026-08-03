@@ -422,6 +422,8 @@ if __name__ == '__main__':
     parser.add_argument('--no-lambda', action='store_true', help='Disable lambda_d hierarchy')
     parser.add_argument('--accum', type=int, default=1, help='Gradient accumulation steps')
     parser.add_argument('--bind-twist-mode', default='shift', help='BottleneckBind twist mode (off/shift/cascade)')
+    parser.add_argument('--head', default='partitioned', choices=['partitioned', 'sigmoid_coded'],
+                        help='LM head mode (default: partitioned)')
     parser.add_argument('--device', default='cuda', help='Device (cuda/cpu)')
     args = parser.parse_args()
 
@@ -433,6 +435,7 @@ if __name__ == '__main__':
         eval_interval=args.eval_interval, save_interval=args.save_interval,
         lambda_d_enabled=not args.no_lambda,
         bind_twist_mode=args.bind_twist_mode,
+        head_mode=args.head,
         data_dir=args.data_dir, save_dir=args.save_dir,
         grad_clip=0.5, conv_kernel=48,
         accum_steps=args.accum, compile=args.compile,

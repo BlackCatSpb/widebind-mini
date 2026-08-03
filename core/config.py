@@ -25,6 +25,11 @@ class WideBandConfig:
     tie_mirror_proj: bool = True
     zeckendorf_readout: bool = False
 
+    # Head selector (overrides zeckendorf_readout when non-default)
+    #   "partitioned"   → PartitionedHead (linear V-logits + softmax-CE)
+    #   "sigmoid_coded" → SigmoidCodedHead (factored Bernoulli, no softmax, O(K) train)
+    head_mode: str = "partitioned"
+
     code_dim: int = 32
     code_sparsity: int = 6
 
