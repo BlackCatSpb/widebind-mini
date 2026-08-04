@@ -6,6 +6,9 @@ Usage:
     python train.py --data-dir ./data
     python train.py --data-dir ./data --D 1024 --n-layers 16
     python train.py --data-dir ./data --accum 8  (effective batch = 1024*8 = 8192)
+    python train.py --data-dir ./wb --head codec --seq-len 256  (SignedAmpCodec:
+        CE-цель + W_pred + эхо, подтверждённый рецепт; VRAM ~3.8GB при D=896/L=512,
+        ~7.2GB при seq-len 512 — для 4GB GPU берите --seq-len 256)
 """
 
 import os, sys, math, time, glob, argparse, gc
@@ -66,7 +69,7 @@ def evaluate(model, streams, cfg, device):
             x, y = x.to(device), y.to(device)
             h = model.embed_tokens(x)
             out, state, gs = model(h, state, global_state=gs, adaptive=False)
-            loss = model.compute_loss(out, y)
+            loss = model.compute_loss(out, y, h_emb=h)
             total_loss += loss.item()
             steps += 1
             if _ % 25 == 24:
@@ -201,7 +204,7 @@ def train(cfg, data_dir, device):
             out, state, gs = model(h, state, global_state=gs, step=step)
 
             # Compute losses (raw, unweighted)
-            ce_loss, aux_dict = model.compute_losses(out, y)
+            ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
 
             # Aux mirror loss (predict macro-embedding of next 10 tokens from last state)
             if aux_target is not None and model._cached_aux_pred is not None:
@@ -422,8 +425,9 @@ if __name__ == '__main__':
     parser.add_argument('--no-lambda', action='store_true', help='Disable lambda_d hierarchy')
     parser.add_argument('--accum', type=int, default=1, help='Gradient accumulation steps')
     parser.add_argument('--bind-twist-mode', default='shift', help='BottleneckBind twist mode (off/shift/cascade)')
-    parser.add_argument('--head', default='partitioned', choices=['partitioned', 'sigmoid_coded'],
-                        help='LM head mode (default: partitioned)')
+    parser.add_argument('--head', default='partitioned',
+                        choices=['partitioned', 'sigmoid_coded', 'cognitive_coded', 'codec'],
+                        help='LM head mode (default: partitioned; codec = SignedAmpCodec CE)')
     parser.add_argument('--device', default='cuda', help='Device (cuda/cpu)')
     args = parser.parse_args()
 
@@ -436,6 +440,7 @@ if __name__ == '__main__':
         lambda_d_enabled=not args.no_lambda,
         bind_twist_mode=args.bind_twist_mode,
         head_mode=args.head,
+        amp_codec=(args.head == 'codec'),
         data_dir=args.data_dir, save_dir=args.save_dir,
         grad_clip=0.5, conv_kernel=48,
         accum_steps=args.accum, compile=args.compile,

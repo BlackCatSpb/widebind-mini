@@ -23,3 +23,9 @@ Thumbs.db
 
 # Logs
 logs/
+
+# Active training run checkpoints
+checkpoints_codec/
+# Logs
+*.log
+*.err

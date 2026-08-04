@@ -28,10 +28,27 @@ class WideBandConfig:
     # Head selector (overrides zeckendorf_readout when non-default)
     #   "partitioned"   → PartitionedHead (linear V-logits + softmax-CE)
     #   "sigmoid_coded" → SigmoidCodedHead (factored Bernoulli, no softmax, O(K) train)
+    #   "codec"         → SignedAmpCodec (порт из основного репо): SignedAmpEmbedding +
+    #                     SignedAmpHead с CE-целью, W_pred, эхо-каналом (подтверждённый рецепт)
     head_mode: str = "partitioned"
 
     code_dim: int = 32
     code_sparsity: int = 6
+
+    # ─── SignedAmpCodec (порт из основного репо, рецепт docs/AMPLITUDE_CODEC.md) ───
+    amp_codec: bool = False       # True → SignedAmpEmbedding + SignedAmpHead
+    amp_pred: bool = True         # механизм A: оператор перехода W_pred (K×K)
+    amp_obj: str = 'ce'           # 'ce' — одна CE-цель (подтверждён); 'mh' — margin+hinge
+    amp_scale: float = 1.0        # масштаб записи кода в residual stream
+    amp_sigma_min: float = 0.2    # нижняя граница σ (коробка [σ_min, 1] на forward)
+    amp_gain_init: float = 0.5    # стартовый gain чтения (против насыщения tanh)
+    amp_proto_init: float = 0.2   # разброс прототипов амплитуд α_vk
+    amp_seed: int = 0             # детерминизм базиса/прототипов/кодов
+
+    # CognitiveCodedHead: normalize token scores over the code space (the only
+    # honest fix for the C(K,S)>V calibration leak). False keeps the strict
+    # unnormalized factored Bernoulli (miscalibrated by construction).
+    head_normalize: bool = True
 
     mirror_k: int = 32
     mirror_k_staircase: bool = True

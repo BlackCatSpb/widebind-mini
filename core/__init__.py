@@ -13,5 +13,7 @@ from .vsa_utils import (
 )
 from .zeckendorf_readout import ZeckendorfReadout
 from .sigmoid_head import SigmoidCodedHead
+from .cognitive_head import CognitiveCodedHead
+from .amp_codec import SignedAmpEmbedding, SignedAmpHead
 
 CognitiveMirror = GroupedCognitiveMirror

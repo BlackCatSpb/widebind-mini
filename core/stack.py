@@ -9,6 +9,8 @@ from .embedding import PartitionedEmbedding, PartitionedHead
 from .block import WideBindBlock
 from .zeckendorf_readout import ZeckendorfReadout
 from .sigmoid_head import SigmoidCodedHead
+from .cognitive_head import CognitiveCodedHead
+from .amp_codec import SignedAmpEmbedding, SignedAmpHead
 
 
 class AdaptiveController:
@@ -128,14 +130,24 @@ class WideBindStack(nn.Module):
     def __init__(self, cfg: WideBindConfig):
         super().__init__()
         self.cfg = cfg
-        self.embed = PartitionedEmbedding(cfg)
-        head_mode = getattr(cfg, 'head_mode', 'partitioned')
-        if getattr(cfg, 'zeckendorf_readout', False):
-            self.lm_head = ZeckendorfReadout(cfg)
-        elif head_mode == 'sigmoid_coded':
-            self.lm_head = SigmoidCodedHead(cfg, embed_basis=self.embed.basis)
+        if getattr(cfg, 'amp_codec', False):
+            # Подтверждённый порт из основного репо: кодек («подписанная амплитуда»)
+            # с одной CE-целью, W_pred (механика A) и двухканальным чтением (эхо).
+            self.embed = SignedAmpEmbedding(cfg)
+            self.lm_head = SignedAmpHead(cfg,
+                                         embed_basis=self.embed.basis,
+                                         embed_proto=self.embed.proto)
         else:
-            self.lm_head = PartitionedHead(cfg, embed_basis=self.embed.basis)
+            self.embed = PartitionedEmbedding(cfg)
+            head_mode = getattr(cfg, 'head_mode', 'partitioned')
+            if getattr(cfg, 'zeckendorf_readout', False):
+                self.lm_head = ZeckendorfReadout(cfg)
+            elif head_mode == 'sigmoid_coded':
+                self.lm_head = SigmoidCodedHead(cfg, embed_basis=self.embed.basis)
+            elif head_mode == 'cognitive_coded':
+                self.lm_head = CognitiveCodedHead(cfg, embed_basis=self.embed.basis)
+            else:
+                self.lm_head = PartitionedHead(cfg, embed_basis=self.embed.basis)
 
         self.layers = nn.ModuleList([
             WideBindBlock(cfg, i) for i in range(cfg.n_layers)
@@ -276,8 +288,8 @@ class WideBindStack(nn.Module):
     def embed_tokens(self, tokens):
         return self.embed(tokens)
 
-    def compute_loss(self, h, targets, pred_weight=None):
-        ce_loss, _ = self.compute_losses(h, targets, pred_weight=pred_weight)
+    def compute_loss(self, h, targets, pred_weight=None, h_emb=None):
+        ce_loss, _ = self.compute_losses(h, targets, pred_weight=pred_weight, h_emb=h_emb)
         return ce_loss
 
     def _finalize_ce(self, ce, targets):
@@ -294,12 +306,21 @@ class WideBindStack(nn.Module):
             ce_loss = ce_m.sum() / mask.sum().clamp(min=1)
         return ce_loss
 
-    def compute_losses(self, h, targets, pred_weight=None):
+    def compute_losses(self, h, targets, pred_weight=None, h_emb=None):
         if isinstance(self.lm_head, ZeckendorfReadout):
             B, L, D = h.shape
             log_probs = self.lm_head.log_probs_for_target(
                 h.reshape(-1, D), targets.reshape(-1))
             ce = -log_probs.reshape(-1)
+            ce_loss = self._finalize_ce(ce, targets)
+        elif getattr(self.cfg, 'amp_codec', False) and hasattr(self.lm_head, 'ce_loss'):
+            # SignedAmpCodec: одна CE-цель по факторизованному счёту (без softmax-головы,
+            # но с LSE-нормализацией по V). h_emb — эхо-канал (своя запись, +3pt рецепта).
+            B, L, D = h.shape
+            hf = h.reshape(-1, D)
+            he = None if h_emb is None else h_emb.reshape(-1, D)
+            t = targets.reshape(-1)
+            ce = self.lm_head.ce_loss(hf, t, he)
             ce_loss = self._finalize_ce(ce, targets)
         elif hasattr(self.lm_head, 'log_probs_for_target'):
             # SigmoidCodedHead: точный per-target log P за O(K), без
