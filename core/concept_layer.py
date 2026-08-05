@@ -111,6 +111,8 @@ class CollectiveConceptLayer(nn.Module):
     def _maybe_write(self, hp, pen, allow_write):
         """Mature-gated, confident+novel slot refinement and birth."""
         self._step += 1
+        if self._step.item() < 3:
+            print(f'DEBUG _maybe_write: step={self._step.item()} write_delay={self._write_delay} allow_write={allow_write} mature={self._mature.item():.1f}')
         if self._step.item() < self._write_delay:
             return
         if not allow_write:
@@ -127,11 +129,15 @@ class CollectiveConceptLayer(nn.Module):
         best_sim = sim.max(dim=-1).values
         d_min = 1.0 - best_sim                        # (B,L)
         conf = torch.sigmoid(-pen)                    # (B,L) low pred_error -> confident
-        conf_thresh = conf.median().clamp(min=0.05)
+        conf_thresh = conf.median().clamp(min=0.01)
+        if self._step.item() < 3:
+            print(f'DEBUG collective: step={self._step.item()} pen_mean={pen.mean().item():.3f} conf_mean={conf.mean().item():.3f} conf_thresh={conf_thresh.item():.3f} best_unique={best.unique().tolist()} mask_any={(best == 0).any().item()}')
 
         # refine nearest slot with confident tokens
         for s in range(self.S):
-            mask = (best == s) & (conf > conf_thresh)
+            mask = (best == s) & (conf >= conf_thresh)
+            if self._step.item() < 3:
+                print(f'DEBUG L{s}: best={best[:5].tolist()} mask_any={mask.any().item()} conf_thresh={conf_thresh.item():.3f}')
             if mask.any():
                 upd = F.normalize(shared[mask].mean(dim=0), dim=-1)
                 if self.N_s[s].item() < 10:
@@ -144,7 +150,7 @@ class CollectiveConceptLayer(nn.Module):
 
         # birth: empty slot + confident novel tokens
         empty = torch.nonzero(self.N_s == 0)
-        novel = (d_min > self._birth_gap * 0.2) & (conf > conf_thresh)
+        novel = (d_min > self._birth_gap * 0.2) & (conf >= conf_thresh)
         if empty.numel() > 0 and novel.any():
             idx = empty[0].item()
             self.M.data[idx] = F.normalize(shared[novel].mean(dim=0), dim=-1)
@@ -163,6 +169,8 @@ class CollectiveConceptLayer(nn.Module):
         self.U_s.mul_(0.99).add_(occ.to(self.U_s), alpha=0.01)
 
     def forward(self, h, hp, pen, resvar=None, context_mem=None, allow_write=None, mature_override=None):
+        if self._step.item() < 3:
+            print(f'DEBUG collective.forward: step={self._step.item()} pen={pen.mean().item():.3f} if pen is not None else None')
         """
         h   (B,L,D)   block input state (pre-block RMSNorm output)
         hp  (B,L,G,k) mirror K-states

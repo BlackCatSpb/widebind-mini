@@ -354,13 +354,10 @@ def train(cfg, data_dir, device):
                 lc = getattr(model, '_cached_losses', {})
                 aux_str = ' '.join(f'{k}={v:.4f}' for k, v in lc.items())
                 col_str = ''
-                for l in model.layers:
+                for li, l in enumerate(model.layers):
                     if getattr(l, 'collective', None) is not None:
                         cd = l.collective.debug()
-                        col_str = (f' | col: mature={cd["mature"]:.2f} '
-                                   f'u={cd["u_gate"]:.3f} c={cd["c_gate"]:.3f} '
-                                   f'scale={cd["read_scale"]:.3f} occ={cd["occupied"]}/{len(cd["U_s"])} '
-                                   f'U={cd["U_s"]}')
+                        col_str += f' | L{li}:m={cd["mature"]:.0f},N={cd["N_s"]}'
                 print(f'step={step:>6} loss={ce_loss.item():.4f} |1-a|={idiff:.4f} '
                       f'g_var={gvar:.4f} ls_var={ls_var:.4f} lr={lr:.2e} tok/s={tokens/dt:.0f} '
                       f'ms={mean_mirror_scale:.3f} mr={mean_ratio:.4f} '
@@ -473,7 +470,7 @@ if __name__ == '__main__':
         accum_steps=args.accum, compile=args.compile,
         private_mem=True,
         collective_layer=True,
-        collective_write_delay=1000,
+        collective_write_delay=50,
         collective_layer_idx=None,
         aux_mirror_weight=args.aux_mirror_weight,
         expert_asymmetry=not args.no_expert_asymmetry,
