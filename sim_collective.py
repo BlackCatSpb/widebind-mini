@@ -66,7 +66,7 @@ def run_sim(layer, steps, rv_fn, hp_fn, pen_fn, label):
 
 # ─── Scenario 1: maturation -> births -> eviction ──────────────────────
 print('Scenario 1: layer matures (resvar falls), births begin, bank fills, eviction recycles')
-layer1 = CollectiveConceptLayer(D=896, k=16, S=8, write_delay=3, birth_gap=0.5)
+layer1 = CollectiveConceptLayer(D=896, k=16, S=8, write_delay=3, birth_gap=0.5, cfg=None)
 layer1._maturity_warmup = 3
 concepts = []
 def rv1(s):

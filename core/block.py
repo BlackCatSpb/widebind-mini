@@ -99,7 +99,8 @@ class WideBindBlock(nn.Module):
                               swiglu=getattr(cfg, 'mlp_swiglu', True))
 
         self.collective = None
-        if getattr(cfg, 'collective_layer', False) and layer_idx == getattr(cfg, 'collective_layer_idx', 6):
+        col_idx = getattr(cfg, 'collective_layer_idx', None)
+        if getattr(cfg, 'collective_layer', False) and (col_idx is None or layer_idx == col_idx):
             self.collective = CollectiveConceptLayer(
                 cfg.D, k=k, S=getattr(cfg, 'collective_S', 8),
                 write_delay=getattr(cfg, 'collective_write_delay', 5000),

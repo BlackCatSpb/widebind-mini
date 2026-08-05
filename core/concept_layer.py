@@ -32,8 +32,10 @@ class CollectiveConceptLayer(nn.Module):
     def __init__(self, D, k, S=8, write_delay=5000,
                  uncert_theta=0.5, uncert_kappa=3.0,
                  contra_thresh=-0.1, contra_gain=6.0,
-                 birth_gap=0.55, maturity_frac=0.85, seed=None):
+                 birth_gap=0.55, maturity_frac=0.85, seed=None,
+                 cfg=None):
         super().__init__()
+        self.cfg = cfg
         self.D = D
         self.k = k
         self.S = S
@@ -80,30 +82,30 @@ class CollectiveConceptLayer(nn.Module):
 
     @torch.no_grad()
     def _update_maturity(self, resvar):
-        """Maturity via variance stabilization: mature when resvar stops changing.
+        """Adaptive maturity: based on resvar stabilization, not fixed warmup.
 
-        Tracks EMA of resvar and its variance. When the coefficient of variation
-        (std/mean) drops below threshold, the system has stabilized."""
+        Maturity when coefficient of variation (CV = std/mean) of resvar
+        drops below 1/λ_d for ceil(λ_d) consecutive steps.
+        No fixed warmup — adapts to training dynamics."""
         if resvar is None:
             return
+        lam = getattr(self.cfg, 'lambda_d', 3) if self.cfg else 3
+        lam_inv = 1.0 / lam
         if not hasattr(self, '_resvar_ema'):
             self.register_buffer('_resvar_ema', torch.tensor(resvar))
             self.register_buffer('_resvar_var', torch.tensor(1.0))
             self.register_buffer('_mature_count', torch.zeros(1, dtype=torch.long))
-        ema = 0.95
+        ema_rate = lam_inv
         delta = resvar - self._resvar_ema.item()
-        self._resvar_ema.fill_(self._resvar_ema.item() + (1 - ema) * delta)
-        self._resvar_var.mul_(ema).add_(delta * delta * (1 - ema))
+        self._resvar_ema.fill_(self._resvar_ema.item() + ema_rate * delta)
+        self._resvar_var.mul_(1 - ema_rate).add_(delta * delta * ema_rate)
         cv = (self._resvar_var.item() ** 0.5) / (abs(self._resvar_ema.item()) + 1e-8)
-        if self._step.item() < 20:
-            self._mature.fill_(0.0)
-            return
-        stable = cv < 0.3
+        stable = cv < lam_inv
         if stable:
             self._mature_count += 1
         else:
             self._mature_count.zero_()
-        self._mature.fill_(1.0 if self._mature_count.item() >= 3 else 0.0)
+        self._mature.fill_(1.0 if self._mature_count.item() >= math.ceil(lam) else 0.0)
 
     @torch.no_grad()
     def _maybe_write(self, hp, pen, allow_write):

@@ -11,8 +11,9 @@ Usage:
         ~7.2GB при seq-len 512 — для 4GB GPU берите --seq-len 256)
 """
 
-import os, sys, math, time, glob, argparse, gc
+import os, sys, math, time, glob, argparse, gc, logging
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
@@ -368,31 +369,30 @@ def train(cfg, data_dir, device):
                     torch.cuda.reset_peak_memory_stats()
 
             if step > 0 and step % cfg.eval_interval == 0:
-                 vl = evaluate(model, streams, cfg, device)
-                 print(f'  EVAL step={step}: val_loss={vl:.4f} val_ppl={math.exp(vl):.2f}')
-                 scheduler.report_val_loss(vl)
-                 torch.cuda.empty_cache(); gc.collect()
-                 # Pre-save cleanup
-                 if device == 'cuda':
-                     torch.cuda.synchronize()
+                vl = evaluate(model, streams, cfg, device)
+                print(f'  EVAL step={step}: val_loss={vl:.4f} val_ppl={math.exp(vl):.2f}')
+                scheduler.report_val_loss(vl)
+                torch.cuda.empty_cache(); gc.collect()
+                if device == 'cuda':
+                    torch.cuda.synchronize()
                 if vl < best_val:
                     best_val = vl
-                 torch.save({
-                     'step': step, 'model': model.state_dict(),
-                     'best_val_loss': best_val, 'cfg': cfg,
-                 }, os.path.join(cfg.save_dir, 'best.pt'))
-                 print(f'  New best!')
-             try:
-                 torch.save({
-                     'step': step, 'model': model.state_dict(),
-                     'best_val_loss': best_val, 'cfg': cfg,
-                     'optimizer': optimizer.state_dict(),
-                     'scheduler': scheduler.state_dict(),
-                 }, os.path.join(cfg.save_dir, f'eval_{step}.pt'))
-                 print(f'  Saved eval_{step}.pt')
-             except Exception as e:
-                 print(f'  EVAL SAVE ERROR: {type(e).__name__}: {e}')
-                 import traceback; traceback.print_exc()
+                    torch.save({
+                        'step': step, 'model': model.state_dict(),
+                        'best_val_loss': best_val, 'cfg': cfg,
+                    }, os.path.join(cfg.save_dir, 'best.pt'))
+                    print(f'  New best!')
+                try:
+                    torch.save({
+                        'step': step, 'model': model.state_dict(),
+                        'best_val_loss': best_val, 'cfg': cfg,
+                        'optimizer': optimizer.state_dict(),
+                        'scheduler': scheduler.state_dict(),
+                    }, os.path.join(cfg.save_dir, f'eval_{step}.pt'))
+                    print(f'  Saved eval_{step}.pt')
+                except Exception as e:
+                    print(f'  EVAL SAVE ERROR: {type(e).__name__}: {e}')
+                    import traceback; traceback.print_exc()
 
             if step > 0 and step % cfg.save_interval == 0:
                 try:
@@ -474,7 +474,7 @@ if __name__ == '__main__':
         private_mem=True,
         collective_layer=True,
         collective_write_delay=1000,
-        collective_layer_idx=args.n_layers - 1,
+        collective_layer_idx=None,
         aux_mirror_weight=args.aux_mirror_weight,
         expert_asymmetry=not args.no_expert_asymmetry,
         meta_trust=not args.no_meta_trust,
