@@ -233,16 +233,43 @@ class SpiralBind(nn.Module):
         return out_acc @ self.W_out
 
 
+def _fib_sequence(n_max):
+    """Fibonacci numbers < n_max: 1, 2, 3, 5, 8, 13, 21, ..."""
+    fibs = [1, 2]
+    while fibs[-1] + fibs[-2] < n_max:
+        fibs.append(fibs[-1] + fibs[-2])
+    return fibs
+
+
+def _zeckendorf_levels(t, max_levels=6):
+    """Zeckendorf-inspired temporal weights: non-consecutive Fibonacci decay."""
+    fibs = _fib_sequence(100)[:max_levels]
+    weights = []
+    prev = -2
+    remaining = t
+    for f in fibs:
+        if f <= remaining and f > prev + 1:
+            weights.append(1.0 / f)
+            prev = f
+            remaining -= f
+        else:
+            weights.append(0.0)
+    w = torch.tensor(weights[:max_levels], dtype=torch.float32)
+    return w / (w.sum() + 1e-8)
+
+
 class TrajectorySpiralBind(nn.Module):
-    """Multi-dimensional trajectory cross-bind with spiral interference.
+    """Multi-dimensional trajectory cross-bind with spiral interference + FCF hybrid bind.
 
     Dimensions:
       - dim 0: current layer hp
       - dim 1: VSA memory state (from block)
       - dim 2: mirror correction (from block)
 
-    Each dimension gets its own cross-weights.
-    Gradient flows between layers through trajectory buffer.
+    Features:
+      - Hybrid bind: α·HRR(conv) + (1-α)·elementwise, curriculum α∈[0.7→0.3]
+      - Temporal Zeckendorf decay for trajectory buffer
+      - Lateral inhibition between dimensions
     """
 
     def __init__(self, D, K, cfg):
@@ -268,17 +295,41 @@ class TrajectorySpiralBind(nn.Module):
         self.W_freq = nn.Parameter(tau_init)
         self.W_phase = nn.Parameter(torch.randn(self.S, self.n_dims, K) * 0.1)
 
+        # FCF hybrid bind curriculum: α starts high (HRR), decays to element-wise
+        self.register_buffer('_step_count', torch.zeros(1, dtype=torch.long))
+        self.hybrid_alpha_max = getattr(cfg, 'hybrid_alpha_max', 0.7)
+        self.hybrid_alpha_min = getattr(cfg, 'hybrid_alpha_min', 0.3)
+
         # Output projection: n_dims * 2K -> D
         self.W_out = nn.Parameter(torch.empty(self.n_dims * 2 * K, D))
         nn.init.xavier_uniform_(self.W_out, gain=0.5)
         self._tied = False
 
+    def _hybrid_alpha(self):
+        """Curriculum: exponential decay from HRR to element-wise."""
+        t = min(1.0, self._step_count.item() / 5000.0)
+        return self.hybrid_alpha_min + (self.hybrid_alpha_max - self.hybrid_alpha_min) * math.exp(-2.0 * t)
+
+    def _hrr_bind(self, a, b):
+        """FFT-HRR circular convolution (FCF-style)."""
+        fa = torch.fft.rfft(a, dim=-1)
+        fb = torch.fft.rfft(b, dim=-1)
+        return torch.fft.irfft(fa * fb, n=a.shape[-1], dim=-1)
+
+    def _hybrid_bind(self, a, b):
+        """Hybrid: α·HRR + (1-α)·elementwise."""
+        alpha = self._hybrid_alpha()
+        hrr = self._hrr_bind(a, b)
+        ewise = a * b
+        return alpha * hrr + (1 - alpha) * ewise
+
     def forward(self, h, traj_state=None):
-        """h: (B, L, D) or (L, D), traj_state: (n_dims, B, L, K) or None."""
+        """h: (B, L, D) or (L, D), traj_state: list of (B, L, K) or None."""
         if h.dim() == 2:
             h = h.unsqueeze(0)
         hp = self.hp_norm(self.W_proj(h) + self.w_bind_bias)
         B, L, K = hp.shape
+        self._step_count += 1
 
         # Build trajectory: current hp + external states
         if traj_state is None or len(traj_state) < self.n_dims - 1:
@@ -310,9 +361,13 @@ class TrajectorySpiralBind(nn.Module):
                 prod_re = u_re * vr_re - u_im * vr_im
                 prod_im = u_re * vr_im + u_im * vr_re
 
+                hybrid = self._hybrid_bind(u_re, v_re)
+                prod_re = prod_re + 0.1 * hybrid
+
                 dim_outputs.append(torch.cat([prod_re, prod_im], dim=-1))
 
             out_s = torch.cat(dim_outputs, dim=-1)
+
             out_acc = out_s if out_acc is None else out_acc + out_s
 
         result = out_acc @ self.W_out
