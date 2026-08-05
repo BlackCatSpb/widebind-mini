@@ -20,6 +20,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 from core import WideBandConfig, WideBindStack, MirrorLRScheduler, AdaptiveController
 from core.amp_optim import build_amp_groups, AmpAdam
 
+# File logging for post-mortem debugging
+os.makedirs('logs', exist_ok=True)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s',
+    handlers=[logging.FileHandler('logs/train.log', mode='a', encoding='utf-8')])
+_ = logging.getLogger(__name__)
 
 # ─── Data ────────────────────────────────────────────────────────────────
 
@@ -481,4 +486,11 @@ if __name__ == '__main__':
     cfg = WideBandConfig(**cfg_kw)
 
     device = args.device if torch.cuda.is_available() else 'cpu'
-    train(cfg, args.data_dir, device)
+    try:
+        train(cfg, args.data_dir, device)
+    except Exception as e:
+        import traceback
+        with open('logs/crash.log', 'w', encoding='utf-8') as f:
+            f.write(f'FATAL: {type(e).__name__}: {e}\n\n')
+            traceback.print_exc(file=f)
+        raise
