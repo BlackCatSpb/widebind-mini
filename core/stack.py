@@ -685,6 +685,7 @@ class MirrorLRScheduler:
             lr_min_ratio = getattr(cfg, 'lr_min_ratio', lr_min_ratio)
             max_decay_steps = getattr(cfg, 'max_decay_steps', max_decay_steps)
             var_min_for_lr_decay = getattr(cfg, 'var_min_for_lr_decay', var_min_for_lr_decay)
+        self.cfg = cfg
         self.model = model
         self.optimizer = optimizer
         self.base_lr = base_lr
