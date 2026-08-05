@@ -95,15 +95,15 @@ class CollectiveConceptLayer(nn.Module):
         self._resvar_ema.fill_(self._resvar_ema.item() + (1 - ema) * delta)
         self._resvar_var.mul_(ema).add_(delta * delta * (1 - ema))
         cv = (self._resvar_var.item() ** 0.5) / (abs(self._resvar_ema.item()) + 1e-8)
-        if self._step.item() < 50:
+        if self._step.item() < 20:
             self._mature.fill_(0.0)
             return
-        stable = cv < 0.15
+        stable = cv < 0.3
         if stable:
             self._mature_count += 1
         else:
             self._mature_count.zero_()
-        self._mature.fill_(1.0 if self._mature_count.item() >= 10 else 0.0)
+        self._mature.fill_(1.0 if self._mature_count.item() >= 3 else 0.0)
 
     @torch.no_grad()
     def _maybe_write(self, hp, pen, allow_write):
@@ -141,7 +141,7 @@ class CollectiveConceptLayer(nn.Module):
 
         # birth: empty slot + confident novel tokens
         empty = torch.nonzero(self.N_s == 0)
-        novel = (d_min > self._birth_gap) & (conf > 0.5)
+        novel = (d_min > self._birth_gap * 0.5) & (conf > 0.3)
         if empty.numel() > 0 and novel.any():
             idx = empty[0].item()
             self.M.data[idx] = F.normalize(shared[novel].mean(dim=0), dim=-1)
