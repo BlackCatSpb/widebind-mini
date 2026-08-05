@@ -127,10 +127,11 @@ class CollectiveConceptLayer(nn.Module):
         best_sim = sim.max(dim=-1).values
         d_min = 1.0 - best_sim                        # (B,L)
         conf = torch.sigmoid(-pen)                    # (B,L) low pred_error -> confident
+        conf_thresh = conf.median().clamp(min=0.05)
 
         # refine nearest slot with confident tokens
         for s in range(self.S):
-            mask = (best == s) & (conf > 0.1)
+            mask = (best == s) & (conf > conf_thresh)
             if mask.any():
                 upd = F.normalize(shared[mask].mean(dim=0), dim=-1)
                 if self.N_s[s].item() < 10:
@@ -143,7 +144,7 @@ class CollectiveConceptLayer(nn.Module):
 
         # birth: empty slot + confident novel tokens
         empty = torch.nonzero(self.N_s == 0)
-        novel = (d_min > self._birth_gap * 0.3) & (conf > 0.1)
+        novel = (d_min > self._birth_gap * 0.2) & (conf > conf_thresh)
         if empty.numel() > 0 and novel.any():
             idx = empty[0].item()
             self.M.data[idx] = F.normalize(shared[novel].mean(dim=0), dim=-1)
