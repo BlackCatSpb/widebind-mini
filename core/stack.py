@@ -603,14 +603,14 @@ class WideBindStack(nn.Module):
                 elif name.startswith('embed.') or name.startswith('lm_head.readout') or name.startswith('lm_head.proj'):
                     k = 'embed_wd' if p.ndim >= 2 else 'embed'
                     groups[k]['params'].append(p)
-                elif any(g in name for g in ['.mirror.alpha_diag', '.mirror.w_pred_scale_legacy',
-                                              '.log_skip_alpha', '.mirror.W_proj', '.mirror.W_out',
-                                              '.mirror.w_temp', '.mirror.w_global',
-                                              '.mirror.log_scale', '.mirror.tanh_bias',
-                                              '.log_dvar_mod_scale', '.dvar_mod_bias',
-                                              '.log_grad_mod_scale', '.grad_mod_bias']):
-                    k = 'mirror_wd' if p.ndim >= 2 else 'mirror'
-                    groups[k]['params'].append(p)
+                 elif any(g in name for g in ['.mirror.alpha_diag', '.mirror.w_pred_scale_legacy',
+                                               '.log_skip_alpha', '.mirror.W_proj', '.mirror.W_out',
+                                               '.mirror.w_temp', '.mirror.w_global',
+                                               '.mirror.tanh_bias',
+                                               '.log_dvar_mod_scale', '.dvar_mod_bias',
+                                               '.log_grad_mod_scale', '.grad_mod_bias']):
+                     k = 'mirror_wd' if (p.ndim >= 2 and '.log_scale' not in name) else 'mirror'
+                     groups[k]['params'].append(p)
                 elif '.mlp.' in name or '.bind.W_proj.weight' in name or name.endswith('.W_out') or name.endswith('.W_proj'):
                     k = 'mlp_wd' if p.ndim >= 2 else 'mlp'
                     groups[k]['params'].append(p)
