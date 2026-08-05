@@ -99,7 +99,7 @@ class GroupedCognitiveMirror(nn.Module):
         alpha_init = torch.exp(-1.0 / tau_k).view(1, k).expand(G, -1).clone()
         if expert_asymmetry and G > 1:
             for g in range(G):
-                init_alpha = 0.85 + (g / (G - 1)) * 0.14
+                init_alpha = 0.15 + (g / (G - 1)) * 0.25
                 alpha_init[g] = init_alpha
         self.alpha_diag = nn.Parameter(alpha_init)
         self.w_pred_scale_legacy = nn.Parameter(torch.ones(G, k))
@@ -139,6 +139,7 @@ class GroupedCognitiveMirror(nn.Module):
                 self.register_buffer('_meta_private_mem', torch.zeros(G), persistent=False)
         self.register_buffer('_hp_grad', torch.zeros(G), persistent=False)
         self.register_buffer('_delta_var', torch.zeros(G), persistent=False)
+        self.register_buffer('_fwd_count', torch.zeros(1, dtype=torch.long), persistent=False)
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
         self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
@@ -167,7 +168,11 @@ class GroupedCognitiveMirror(nn.Module):
         self._delta_var_ema_min = delta_var_ema_min
         self._delta_var_ema_max = delta_var_ema_max
 
-        self._signal_log_weights = nn.Parameter(fib_sigmoid_init(n_signals))
+        self._signal_log_weights = nn.Parameter(torch.zeros(n_signals))
+
+        _pos_g = torch.Generator().manual_seed(12345)
+        self.register_buffer('_pos_id_buf',
+            torch.sign(torch.randn(1, 4096, 1, k, generator=_pos_g)), persistent=False)
 
         self.usefulness_predictor = nn.Sequential(
             nn.Linear(k, k),
@@ -186,6 +191,8 @@ class GroupedCognitiveMirror(nn.Module):
     def forward(self, h, mem_all, global_state=None, diff=None,
                 tanh_bias_mod=1.0, pred_scale_mod=None, context_mem=None,
                 allow_write=None):
+        self._fwd_count += 1
+        self._progress = 1.0 - math.exp(-self._fwd_count.item() / 200.0)
         B, L, D = h.shape
         G, d, k = self.G, self.d, self.k
 
@@ -202,11 +209,8 @@ class GroupedCognitiveMirror(nn.Module):
         mc_k = torch.einsum('b l gd,gdk->b l gk', mc_g, self.W_proj)
 
         # ─── Bipolar pos_id binding: hp = hp ⊛ pos_id ───
-        # Каждый токен получает уникальный bipolar (±1) ключ-позицию.
-        # VSA scan хранит hp_bound, associative recall по pos_id при unbind.
-        # pos_id: (L, 1, 1, k) — broadcast на G экспертов и B батч.
-        pos_id = torch.sign(torch.randn(1, L, 1, self.k, device=hp.device))
-        hp = hp * pos_id
+        # Детерминированный буфер позиционных кодов (broadcast на B, G).
+        hp = hp * self._pos_id_buf[:, :L]
 
         hp_prev = torch.cat([torch.zeros_like(hp[:, 0:1]), hp[:, :-1]], dim=1)
 
@@ -234,27 +238,27 @@ class GroupedCognitiveMirror(nn.Module):
             alpha_eff = 1.0 + (alpha_eff - 1.0) * damp
             pred_k = hp_prev * alpha_eff.view(1, 1, G, k)
         pred_error = (hp - pred_k) / hp_norm * pred_scale_mod.view(G, 1)
-        with torch.no_grad():
-            override = self._alpha_override.item()
-            if override < 0.1:
-                residual_var = pred_error.var(dim=(0, 1), unbiased=False)
-                self._residual_var_ema.lerp_(residual_var, 0.01)
-                rv = self._residual_var_ema
-                rv_mean = rv.mean(dim=0, keepdim=True)
-                relative_var = rv / (rv_mean + 1e-10)
-                alpha_target = torch.sigmoid(2.2 - torch.log(relative_var))
-                self.alpha_diag.data.lerp_(alpha_target, 0.01)
-                # Alpha novelty push: repulsive force across experts with adaptive gain
-                if self._alpha_novelty_weight > 0 and G > 1:
-                    alpha_per_expert = self.alpha_diag.mean(dim=-1)  # (G,)
-                    alpha_std = alpha_per_expert.std()
-                    boost = max(1.0, 0.1 / (alpha_std + 0.01))
-                    adapted_w = self._alpha_novelty_weight * boost
-                    alpha_center = alpha_per_expert - alpha_per_expert.mean()
-                    novelty_push = (adapted_w * 2
-                                    * alpha_center.unsqueeze(1).expand(-1, k) / G)
-                    self.alpha_diag.data.add_(novelty_push)
-                    self.alpha_diag.data.clamp_(0.01, 0.99)
+        if self.training:
+            with torch.no_grad():
+                override = self._alpha_override.item()
+                if override < 0.1:
+                    residual_var = pred_error.var(dim=(0, 1), unbiased=False)
+                    self._residual_var_ema.lerp_(residual_var, 0.01)
+                    rv = self._residual_var_ema
+                    rv_mean = rv.mean(dim=0, keepdim=True)
+                    relative_var = rv / (rv_mean + 1e-10)
+                    alpha_target = torch.sigmoid(2.2 - torch.log(relative_var))
+                    self.alpha_diag.data.lerp_(alpha_target, 0.01)
+                    if self._alpha_novelty_weight > 0 and G > 1:
+                        alpha_per_expert = self.alpha_diag.mean(dim=-1)
+                        alpha_std = alpha_per_expert.std()
+                        boost = max(1.0, 0.1 / (alpha_std + 0.01))
+                        adapted_w = self._alpha_novelty_weight * boost
+                        alpha_center = alpha_per_expert - alpha_per_expert.mean()
+                        novelty_push = (adapted_w * 2
+                                        * alpha_center.unsqueeze(1).expand(-1, k) / G)
+                        self.alpha_diag.data.add_(novelty_push)
+                        self.alpha_diag.data.clamp_(0.01, 0.99)
         self._cached_pred_k = _pred_k_aux
         self._cached_hp = hp
         pred_error_norm = (raw_pred_error / hp_norm).norm(dim=(-2, -1))
@@ -353,9 +357,10 @@ class GroupedCognitiveMirror(nn.Module):
         signals_normed = []
         decay_ema = 0.01
         for i, s in enumerate(signals):
-            with torch.no_grad():
-                rms = s.norm(dim=(-2, -1), keepdim=True).mean(dim=(0, 1), keepdim=True)
-                self._signal_norm_ema[i].mul_(1 - decay_ema).add_(rms.squeeze(), alpha=decay_ema)
+            if self.training:
+                with torch.no_grad():
+                    rms = s.norm(dim=(-2, -1), keepdim=True).mean(dim=(0, 1), keepdim=True)
+                    self._signal_norm_ema[i].mul_(1 - decay_ema).add_(rms.squeeze(), alpha=decay_ema)
             s_norm = s / (self._signal_norm_ema[i].unsqueeze(0).unsqueeze(0) + 1e-8)
             signals_normed.append(s_norm)
 
@@ -382,30 +387,22 @@ class GroupedCognitiveMirror(nn.Module):
         delta = delta + self.tanh_bias * tanh_bias_mod
 
         grad_mod = torch.exp(self.log_grad_mod_scale) * torch.tanh(self._prev_grad_norm + self.grad_mod_bias)
-        with torch.no_grad():
-            dvar = delta.var(dim=(0, 1), unbiased=False).mean(dim=-1)
-            if diff is not None:
-                ema_alpha = self._delta_var_ema_min + diff * (self._delta_var_ema_max - self._delta_var_ema_min)
-            else:
-                ema_alpha = 0.9
-            self._delta_var.mul_(ema_alpha).add_(dvar * (1.0 - ema_alpha))
+        if self.training:
+            with torch.no_grad():
+                dvar = delta.var(dim=(0, 1), unbiased=False).mean(dim=-1)
+                if diff is not None:
+                    ema_alpha = self._delta_var_ema_min + diff * (self._delta_var_ema_max - self._delta_var_ema_min)
+                else:
+                    ema_alpha = 0.9
+                self._delta_var.mul_(ema_alpha).add_(dvar * (1.0 - ema_alpha))
         dvar_mod = torch.exp(self.log_dvar_mod_scale) * torch.tanh(self._delta_var + self.dvar_mod_bias)
 
         usefulness_logits = self.usefulness_predictor(delta).squeeze(-1)
-        temp = self._usefulness_temp.clamp(min=0.1)
+        prog = getattr(self, '_progress', 0.0)
+        temp = max(0.3, 3.0 * math.exp(-prog * 2.0))
         with torch.no_grad():
             threshold = usefulness_logits.median(dim=-1, keepdim=True).values
         usefulness = torch.sigmoid((usefulness_logits - threshold) / temp)
-        with torch.no_grad():
-            override = self._alpha_override.item()
-            if override < 0.1:
-                u_ent = -(usefulness * torch.log(usefulness + 1e-10) +
-                          (1 - usefulness) * torch.log(1 - usefulness + 1e-10))
-                u_ent_mean = u_ent.sum(dim=-1).mean()
-                target_ent = 0.75 * G * 0.693
-                temp_err = u_ent_mean - target_ent
-                self._usefulness_temp.data.add_(-0.001 * temp_err * self._usefulness_temp.data)
-                self._usefulness_temp.data.clamp_(min=0.3, max=4.0)
 
         mlp_mod = usefulness * torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)
         mem_mod = usefulness * torch.sigmoid(self.mod_scale_mem).view(1, 1, G)
@@ -413,7 +410,11 @@ class GroupedCognitiveMirror(nn.Module):
         linear = torch.einsum('blgk,gkd->blgd', delta, self.W_out)
         skip_alpha = torch.exp(self.log_skip_alpha).view(1, 1, G, 1)
         mirror = torch.tanh(linear) + skip_alpha * linear
-        mirror = mirror * torch.exp(self.log_scale)
+        # Adaptive scale: prevents saturation when delta is large
+        # scale ∝ 1/(1 + ‖delta‖) per expert (broadcast across d)
+        delta_norm = delta.norm(dim=-1, keepdim=True).mean(dim=(0, 1), keepdim=True).clamp(min=1e-8)
+        adapt_scale = 1.0 / (1.0 + 0.1 * delta_norm)  # (1, 1, G, 1)
+        mirror = mirror * torch.exp(self.log_scale) * adapt_scale
 
         gate_signal = torch.abs(pred_error)
         gate_logits = torch.einsum('blgk,gk->blg', gate_signal, self.w_gate) + self.b_gate
@@ -448,7 +449,8 @@ class GroupedCognitiveMirror(nn.Module):
         expert_gate = torch.sigmoid(gate_logits)
         self._cached_gate_l1 = expert_gate.mean()
         self._cached_gate_usage = expert_gate.mean(dim=(0, 1))
-        self._gate_ema.data.mul_(0.99).add_(self._cached_gate_usage.detach(), alpha=0.01)
+        if self.training:
+            self._gate_ema.data.mul_(0.99).add_(self._cached_gate_usage.detach(), alpha=0.01)
         self._cached_usefulness = usefulness
         self._cached_gate = expert_gate.detach()
 

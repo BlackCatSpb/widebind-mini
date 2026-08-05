@@ -166,3 +166,155 @@ class BottleneckBind(nn.Module):
                     term = a[n] * w.unsqueeze(-1)
                     m = term if m is None else m + term
                 return m @ self.W_out
+
+
+class SpiralBind(nn.Module):
+    """Multi-scale interference cross-mixing with learned frequencies.
+
+    Replaces discrete shifts with continuous phase rotations.
+    Per-spiral: u = hp * w_u, v = hp * w_v, v_rot = v * exp(i*θ), prod = u * v_rot
+    Output: concat(Re(prod), Im(prod)) per spiral → sum → single W_out
+    """
+
+    def __init__(self, D, K, cfg):
+        super().__init__()
+        self.D, self.K = D, K
+        self.S = int(getattr(cfg, "bind_twist_S", 4))
+        self.W_proj = nn.Linear(D, K, bias=True)
+        self.w_bind_bias = nn.Parameter(torch.zeros(K))
+        if getattr(cfg, "bind_qk_norm", False):
+            self.hp_norm = nn.RMSNorm(K)
+        else:
+            self.hp_norm = nn.Identity()
+
+        # Complex weights per spiral
+        self.w_u_re = nn.Parameter(torch.randn(self.S, K) * 0.3)
+        self.w_u_im = nn.Parameter(torch.zeros(self.S, K))
+        self.w_v_re = nn.Parameter(torch.randn(self.S, K) * 0.3)
+        self.w_v_im = nn.Parameter(torch.zeros(self.S, K))
+
+        # Per-channel time constants
+        tau_init = torch.log(torch.arange(1, K + 1, dtype=torch.float32) / K).unsqueeze(0).expand(self.S, -1).clone()
+        self.W_freq = nn.Parameter(tau_init)
+        self.W_phase = nn.Parameter(torch.randn(self.S, K) * 0.1)
+
+        # Single output projection: 2K -> D
+        self.W_out = nn.Parameter(torch.empty(2 * K, D))
+        nn.init.xavier_uniform_(self.W_out, gain=0.5)
+        self._tied = False
+
+    def forward(self, h):
+        hp = self.hp_norm(self.W_proj(h) + self.w_bind_bias)
+        K = self.K
+
+        out_acc = None
+        for s in range(self.S):
+            freq = torch.exp(self.W_freq[s]).unsqueeze(0).unsqueeze(0)
+            phase = self.W_phase[s].unsqueeze(0).unsqueeze(0)
+
+            theta = freq * hp + phase
+            cos_t = torch.cos(theta)
+            sin_t = torch.sin(theta)
+
+            u_re = hp * self.w_u_re[s].unsqueeze(0).unsqueeze(0)
+            u_im = hp * self.w_u_im[s].unsqueeze(0).unsqueeze(0)
+            v_re = hp * self.w_v_re[s].unsqueeze(0).unsqueeze(0)
+            v_im = hp * self.w_v_im[s].unsqueeze(0).unsqueeze(0)
+
+            vr_re = v_re * cos_t - v_im * sin_t
+            vr_im = v_re * sin_t + v_im * cos_t
+
+            prod_re = u_re * vr_re - u_im * vr_im
+            prod_im = u_re * vr_im + u_im * vr_re
+
+            out_s = torch.cat([prod_re, prod_im], dim=-1)
+            out_acc = out_s if out_acc is None else out_acc + out_s
+
+        return out_acc @ self.W_out
+
+
+class TrajectorySpiralBind(nn.Module):
+    """Multi-dimensional trajectory cross-bind with spiral interference.
+
+    Dimensions:
+      - dim 0: current layer hp
+      - dim 1: VSA memory state (from block)
+      - dim 2: mirror correction (from block)
+
+    Each dimension gets its own cross-weights.
+    Gradient flows between layers through trajectory buffer.
+    """
+
+    def __init__(self, D, K, cfg):
+        super().__init__()
+        self.D, self.K = D, K
+        self.S = int(getattr(cfg, "bind_twist_S", 4))
+        self.n_dims = int(getattr(cfg, "bind_traj_dims", 3))
+        self.W_proj = nn.Linear(D, K, bias=True)
+        self.w_bind_bias = nn.Parameter(torch.zeros(K))
+        if getattr(cfg, "bind_qk_norm", False):
+            self.hp_norm = nn.RMSNorm(K)
+        else:
+            self.hp_norm = nn.Identity()
+
+        # Per-spiral, per-dimension complex weights
+        self.w_u_re = nn.Parameter(torch.randn(self.S, self.n_dims, K) * 0.3)
+        self.w_u_im = nn.Parameter(torch.zeros(self.S, self.n_dims, K))
+        self.w_v_re = nn.Parameter(torch.randn(self.S, self.n_dims, K) * 0.3)
+        self.w_v_im = nn.Parameter(torch.zeros(self.S, self.n_dims, K))
+
+        # Per-channel time constants
+        tau_init = torch.log(torch.arange(1, K + 1, dtype=torch.float32) / K).unsqueeze(0).unsqueeze(0).expand(self.S, self.n_dims, -1).clone()
+        self.W_freq = nn.Parameter(tau_init)
+        self.W_phase = nn.Parameter(torch.randn(self.S, self.n_dims, K) * 0.1)
+
+        # Output projection: n_dims * 2K -> D
+        self.W_out = nn.Parameter(torch.empty(self.n_dims * 2 * K, D))
+        nn.init.xavier_uniform_(self.W_out, gain=0.5)
+        self._tied = False
+
+    def forward(self, h, traj_state=None):
+        """h: (B, L, D) or (L, D), traj_state: (n_dims, B, L, K) or None."""
+        if h.dim() == 2:
+            h = h.unsqueeze(0)
+        hp = self.hp_norm(self.W_proj(h) + self.w_bind_bias)
+        B, L, K = hp.shape
+
+        # Build trajectory: current hp + external states
+        if traj_state is None or len(traj_state) < self.n_dims - 1:
+            n_have = 0 if traj_state is None else len(traj_state)
+            padding = [torch.zeros_like(hp) for _ in range(self.n_dims - 1 - n_have)]
+            traj = [hp] + (list(traj_state) if traj_state else []) + padding
+        else:
+            traj = [hp] + list(traj_state[:self.n_dims - 1])
+
+        out_acc = None
+        for s in range(self.S):
+            dim_outputs = []
+            for d in range(self.n_dims):
+                freq = torch.exp(self.W_freq[s, d]).unsqueeze(0).unsqueeze(0)
+                phase = self.W_phase[s, d].unsqueeze(0).unsqueeze(0)
+
+                theta = freq * hp + phase
+                cos_t = torch.cos(theta)
+                sin_t = torch.sin(theta)
+
+                u_re = hp * self.w_u_re[s, d].unsqueeze(0).unsqueeze(0)
+                u_im = hp * self.w_u_im[s, d].unsqueeze(0).unsqueeze(0)
+                v_re = traj[d] * self.w_v_re[s, d].unsqueeze(0).unsqueeze(0)
+                v_im = traj[d] * self.w_v_im[s, d].unsqueeze(0).unsqueeze(0)
+
+                vr_re = v_re * cos_t - v_im * sin_t
+                vr_im = v_re * sin_t + v_im * cos_t
+
+                prod_re = u_re * vr_re - u_im * vr_im
+                prod_im = u_re * vr_im + u_im * vr_re
+
+                dim_outputs.append(torch.cat([prod_re, prod_im], dim=-1))
+
+            out_s = torch.cat(dim_outputs, dim=-1)
+            out_acc = out_s if out_acc is None else out_acc + out_s
+
+        result = out_acc @ self.W_out
+        new_traj = traj[1:]
+        return result, new_traj

@@ -85,6 +85,10 @@ class WideBandConfig:
     conv_init_std: float = 0.01
     conv_kernel: int = 48
 
+    bind_twist_mode: str = "trajectory_spiral"
+    bind_twist_S: int = 4
+    bind_traj_dims: int = 3
+
     spec_lo: float = 0.5
     spec_hi: float = 1.5
     lambda_sliding: bool = True
@@ -99,8 +103,6 @@ class WideBandConfig:
     diversity_weight: float = 0.001
     nuclear_weight: float = 1e-5
     orth_weight: float = 1e-4
-    surprisal_weight: float = 0.0
-    branch_balance_weight: float = 0.0
 
     vsa_b_d_max: float = 12.0
     vsa_b_d_smooth: float = 0.999

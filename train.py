@@ -18,6 +18,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 from core import WideBandConfig, WideBindStack, MirrorLRScheduler, AdaptiveController
+from core.amp_optim import build_amp_groups, AmpAdam
 
 
 # ─── Data ────────────────────────────────────────────────────────────────
@@ -108,9 +109,13 @@ def train(cfg, data_dir, device):
     # Data
     streams, total_tokens = load_streams(data_dir)
 
-    # Optimizer
-    groups = model.param_groups()
-    optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95))
+    # Optimizer (AmpAdam для codec-головы, AdamW для partitioned)
+    if getattr(cfg, 'amp_codec', False):
+        groups = build_amp_groups(model, lr=cfg.lr, head_scale=1.0, embed_scale=0.5)
+        optimizer = AmpAdam(groups)
+    else:
+        groups = model.param_groups()
+        optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95))
     scheduler = MirrorLRScheduler(model, optimizer, cfg=cfg)
 
     # Resume
@@ -120,7 +125,11 @@ def train(cfg, data_dir, device):
     ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'step_*.pt')),
                    key=lambda p: int(os.path.basename(p).split('_')[1].split('.')[0]))
     if ckpts:
-        ckpt = torch.load(ckpts[-1], map_location=device, weights_only=False)
+        try:
+            ckpt = torch.load(ckpts[-1], map_location=device, weights_only=False)
+        except Exception as e:
+            print(f'  LOAD ERROR: {e}, trying first checkpoint')
+            ckpt = torch.load(ckpts[0], map_location=device, weights_only=False)
         miss, _ = model.load_state_dict(ckpt['model'], strict=False)
         try:
             optimizer.load_state_dict(ckpt['optimizer'])
@@ -354,35 +363,46 @@ def train(cfg, data_dir, device):
                     torch.cuda.reset_peak_memory_stats()
 
             if step > 0 and step % cfg.eval_interval == 0:
-                vl = evaluate(model, streams, cfg, device)
-                print(f'  EVAL step={step}: val_loss={vl:.4f} ppl={math.exp(vl):.2f}')
-                scheduler.report_val_loss(vl)
-                torch.cuda.empty_cache(); gc.collect()
+                 vl = evaluate(model, streams, cfg, device)
+                 print(f'  EVAL step={step}: val_loss={vl:.4f} val_ppl={math.exp(vl):.2f}')
+                 scheduler.report_val_loss(vl)
+                 torch.cuda.empty_cache(); gc.collect()
+                 # Pre-save cleanup
+                 if device == 'cuda':
+                     torch.cuda.synchronize()
                 if vl < best_val:
                     best_val = vl
-                    torch.save({
-                        'step': step, 'model': model.state_dict(),
-                        'best_val_loss': best_val, 'cfg': cfg,
-                    }, os.path.join(cfg.save_dir, 'best.pt'))
-                    print(f'  New best!')
-                torch.save({
-                    'step': step, 'model': model.state_dict(),
-                    'best_val_loss': best_val, 'cfg': cfg,
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                }, os.path.join(cfg.save_dir, f'eval_{step}.pt'))
-                print(f'  Saved eval_{step}.pt')
+                 torch.save({
+                     'step': step, 'model': model.state_dict(),
+                     'best_val_loss': best_val, 'cfg': cfg,
+                 }, os.path.join(cfg.save_dir, 'best.pt'))
+                 print(f'  New best!')
+             try:
+                 torch.save({
+                     'step': step, 'model': model.state_dict(),
+                     'best_val_loss': best_val, 'cfg': cfg,
+                     'optimizer': optimizer.state_dict(),
+                     'scheduler': scheduler.state_dict(),
+                 }, os.path.join(cfg.save_dir, f'eval_{step}.pt'))
+                 print(f'  Saved eval_{step}.pt')
+             except Exception as e:
+                 print(f'  EVAL SAVE ERROR: {type(e).__name__}: {e}')
+                 import traceback; traceback.print_exc()
 
             if step > 0 and step % cfg.save_interval == 0:
-                ckpt = {
-                    'step': step, 'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'best_val_loss': best_val, 'cfg': cfg,
-                }
-                torch.save(ckpt, os.path.join(cfg.save_dir, f'step_{step}.pt'))
-                print(f'  Saved step_{step}.pt ({len(ckpt)} keys)')
-                del ckpt; gc.collect()
+                try:
+                    ckpt = {
+                        'step': step, 'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'scheduler': scheduler.state_dict(),
+                        'best_val_loss': best_val, 'cfg': cfg,
+                    }
+                    torch.save(ckpt, os.path.join(cfg.save_dir, f'step_{step}.pt'))
+                    print(f'  Saved step_{step}.pt ({len(ckpt)} keys)')
+                    del ckpt; gc.collect()
+                except Exception as e:
+                    print(f'  SAVE ERROR at step {step}: {type(e).__name__}: {e}')
+                    import traceback; traceback.print_exc()
 
     except KeyboardInterrupt:
         ckpt = {
@@ -424,7 +444,9 @@ if __name__ == '__main__':
     parser.add_argument('--no-meta-trust', action='store_true', help='Disable meta-trust instability penalty')
     parser.add_argument('--no-lambda', action='store_true', help='Disable lambda_d hierarchy')
     parser.add_argument('--accum', type=int, default=1, help='Gradient accumulation steps')
-    parser.add_argument('--bind-twist-mode', default='shift', help='BottleneckBind twist mode (off/shift/cascade)')
+    parser.add_argument('--bind-twist-mode', default='trajectory_spiral',
+                        choices=['off', 'shift', 'cascade', 'spiral', 'trajectory_spiral'],
+                        help='Bind mode: off/shift/cascade/spiral/trajectory_spiral')
     parser.add_argument('--head', default='partitioned',
                         choices=['partitioned', 'sigmoid_coded', 'cognitive_coded', 'codec'],
                         help='LM head mode (default: partitioned; codec = SignedAmpCodec CE)')
@@ -444,8 +466,10 @@ if __name__ == '__main__':
         data_dir=args.data_dir, save_dir=args.save_dir,
         grad_clip=0.5, conv_kernel=48,
         accum_steps=args.accum, compile=args.compile,
-        private_mem=args.private_mem,
-        collective_layer=args.collective_layer,
+        private_mem=True,
+        collective_layer=True,
+        collective_write_delay=1000,
+        collective_layer_idx=args.n_layers - 1,
         aux_mirror_weight=args.aux_mirror_weight,
         expert_asymmetry=not args.no_expert_asymmetry,
         meta_trust=not args.no_meta_trust,

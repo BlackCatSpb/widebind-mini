@@ -80,19 +80,30 @@ class CollectiveConceptLayer(nn.Module):
 
     @torch.no_grad()
     def _update_maturity(self, resvar):
-        """The layer matures relative to itself: settled residual variance.
-        Reference is captured after warmup (not at step 0, when resvar is still
-        initialization noise)."""
+        """Maturity via variance stabilization: mature when resvar stops changing.
+
+        Tracks EMA of resvar and its variance. When the coefficient of variation
+        (std/mean) drops below threshold, the system has stabilized."""
         if resvar is None:
             return
-        warmup = getattr(self, '_maturity_warmup', 0)
-        if self._resvar_ref.item() == 0.0 and self._step.item() >= warmup:
-            self._resvar_ref.fill_(max(resvar, 1e-6))
-        if self._resvar_ref.item() == 0.0:
+        if not hasattr(self, '_resvar_ema'):
+            self.register_buffer('_resvar_ema', torch.tensor(resvar))
+            self.register_buffer('_resvar_var', torch.tensor(1.0))
+            self.register_buffer('_mature_count', torch.zeros(1, dtype=torch.long))
+        ema = 0.95
+        delta = resvar - self._resvar_ema.item()
+        self._resvar_ema.fill_(self._resvar_ema.item() + (1 - ema) * delta)
+        self._resvar_var.mul_(ema).add_(delta * delta * (1 - ema))
+        cv = (self._resvar_var.item() ** 0.5) / (abs(self._resvar_ema.item()) + 1e-8)
+        if self._step.item() < 50:
             self._mature.fill_(0.0)
             return
-        mature = resvar < self._resvar_ref.item() * self._maturity_frac
-        self._mature.fill_(1.0 if mature else 0.0)
+        stable = cv < 0.15
+        if stable:
+            self._mature_count += 1
+        else:
+            self._mature_count.zero_()
+        self._mature.fill_(1.0 if self._mature_count.item() >= 10 else 0.0)
 
     @torch.no_grad()
     def _maybe_write(self, hp, pen, allow_write):

@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .config import WideBindConfig
 from .vsa_utils import dct_basis, fib_sigmoid_init
-from .bind import BottleneckBind
+from .bind import BottleneckBind, SpiralBind, TrajectorySpiralBind
 from .mirror import GroupedCognitiveMirror
 from .mlp import GroupedMLP
 from .concept_layer import CollectiveConceptLayer
@@ -22,7 +22,13 @@ class WideBindBlock(nn.Module):
         self.register_buffer('pre_ln_w', torch.ones(cfg.D))
         self.total_layers = cfg.n_layers
 
-        self.bind = BottleneckBind(cfg.D, cfg.bind_K, cfg)
+        bind_mode = getattr(cfg, "bind_twist_mode", "shift")
+        if bind_mode == "trajectory_spiral":
+            self.bind = TrajectorySpiralBind(cfg.D, cfg.bind_K, cfg)
+        elif bind_mode == "spiral":
+            self.bind = SpiralBind(cfg.D, cfg.bind_K, cfg)
+        else:
+            self.bind = BottleneckBind(cfg.D, cfg.bind_K, cfg)
 
         if getattr(cfg, 'mirror_k_staircase', False):
             n = cfg.n_layers
@@ -150,7 +156,19 @@ class WideBindBlock(nn.Module):
         if _chk(h, 'conv'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         self._cache_conv_out = h_conv
 
-        bind_out = self.bind(h)
+        if isinstance(self.bind, TrajectorySpiralBind):
+            traj_state = getattr(self, '_traj_state', None)
+            bind_out, new_traj = self.bind(h, traj_state)
+            # Soft EMA decay: τ_t = 0.9 * τ_{t-1} + 0.1 * new_traj
+            if traj_state is None:
+                self._traj_state = [t.detach() for t in new_traj]
+            else:
+                self._traj_state = [
+                    0.9 * old.detach() + 0.1 * new.detach()
+                    for old, new in zip(traj_state, new_traj)
+                ]
+        else:
+            bind_out = self.bind(h)
         if _chk(bind_out, 'bind'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
 
         S = self._n_scales

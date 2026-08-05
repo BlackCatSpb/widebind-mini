@@ -293,18 +293,10 @@ class WideBindStack(nn.Module):
         return ce_loss
 
     def _finalize_ce(self, ce, targets):
-        """Mask PAD/EOS и применить surprisal-weighting (единый хвост CE)."""
+        """Mask PAD/EOS (единый хвост CE)."""
         mask = (targets.reshape(-1) != 0) & (targets.reshape(-1) != 2)
         ce_m = ce * mask.float()
-        sw = getattr(self.cfg, 'surprisal_weight', 0.0)
-        if self.training and sw > 0:
-            with torch.no_grad():
-                ce_ratio = ce_m / (ce_m.mean() + 1e-8)
-                w = torch.sigmoid(2.0 * (ce_ratio - 1.0))
-            ce_loss = (ce_m * w).sum() / mask.sum().clamp(min=1)
-        else:
-            ce_loss = ce_m.sum() / mask.sum().clamp(min=1)
-        return ce_loss
+        return ce_m.sum() / mask.sum().clamp(min=1)
 
     def compute_losses(self, h, targets, pred_weight=None, h_emb=None):
         if isinstance(self.lm_head, ZeckendorfReadout):
@@ -444,24 +436,6 @@ class WideBindStack(nn.Module):
             if n_m2v > 0:
                 w_m2v_loss = w_m2v_loss / n_m2v
 
-        branch_loss = 0.0
-        n_branch = 0
-        if getattr(self.cfg, 'branch_balance_weight', 0.0) > 0:
-            for layer in self.layers:
-                conv = getattr(layer, '_cache_conv_out', None)
-                bnd = getattr(layer, '_cache_bind_out', None)
-                mir = getattr(layer, '_cache_mirror_out', None)
-                if conv is not None and bnd is not None and mir is not None:
-                    vc = conv.norm(dim=-1).var() + 1e-10
-                    vb = bnd.norm(dim=-1).var() + 1e-10
-                    vm = mir.norm(dim=-1).var() + 1e-10
-                    branch_loss = branch_loss + (torch.log(vc) - torch.log(vb)).pow(2)
-                    branch_loss = branch_loss + (torch.log(vc) - torch.log(vm)).pow(2)
-                    branch_loss = branch_loss + (torch.log(vb) - torch.log(vm)).pow(2)
-                    n_branch = n_branch + 3
-            if n_branch > 0:
-                branch_loss = branch_loss / n_branch
-
         ranking_loss = 0.0
         if getattr(self.cfg, 'ranking_weight', 0.0) > 0:
             for layer in self.layers:
@@ -555,7 +529,6 @@ class WideBindStack(nn.Module):
         w_nuc = getattr(cfg, 'nuclear_weight', 0.0)
         w_orth = getattr(cfg, 'orth_weight', 0.0)
         w_wm2v = getattr(cfg, 'w_m2v_hierarchy_weight', 0.0)
-        w_branch = getattr(cfg, 'branch_balance_weight', 0.0)
         w_div = getattr(cfg, 'div_weight', 0.0)
         w_rank = getattr(cfg, 'ranking_weight', 0.0)
         w_gate_rp = getattr(cfg, 'gate_repulse_weight', 0.0)
@@ -578,8 +551,6 @@ class WideBindStack(nn.Module):
             aux_dict['orth'] = orth_loss * w_orth
         if w_m2v_loss != 0 and w_wm2v > 0:
             aux_dict['w_m2v'] = w_m2v_loss * w_wm2v
-        if branch_loss != 0 and w_branch > 0:
-            aux_dict['branch'] = branch_loss * w_branch
         if div_loss_raw != 0 and w_div > 0:
             aux_dict['div'] = div_loss_raw * w_div
         if gate_repulse_loss != 0 and w_gate_rp > 0:
@@ -747,81 +718,42 @@ class MirrorLRScheduler:
         return var_sum / n, mag_sum / n, alpha_sum / n, gate_var_sum / n
 
     def report_val_loss(self, val_loss):
+        """Adaptive LR: λ_d-scaled thresholds, EMA-based improvement detection."""
         if not hasattr(self, '_best_val_loss'):
             self._best_val_loss = val_loss
             self._loss_lr_factor = 1.0
+            self._loss_ema = val_loss
             return
-        if val_loss < self._best_val_loss * 0.999:
+        if not hasattr(self, '_loss_ema'):
+            self._loss_ema = val_loss
+        # EMA of val_loss (scale-invariant via λ_d)
+        self._loss_ema = 0.9 * self._loss_ema + 0.1 * val_loss
+        # Adaptive thresholds: λ_d⁻² ≈ 0.30 relative improvement needed
+        lam = getattr(self.cfg, 'lambda_d', 3)
+        improve_thresh = 1.0 - 1.0 / (lam ** 2)  # ~0.89 for λ=3
+        regress_thresh = 1.0 + 1.0 / (lam ** 4)   # ~1.012 for λ=3
+        if val_loss < self._best_val_loss * improve_thresh:
             self._best_val_loss = val_loss
-            self._loss_lr_factor = 1.0
-        elif val_loss > self._best_val_loss * 1.02:
+            self._loss_lr_factor = min(1.0, self._loss_lr_factor * 1.05)
+        elif val_loss > self._loss_ema * regress_thresh:
             self._loss_lr_factor *= 0.5
-            self._loss_lr_factor = max(self._loss_lr_factor, 0.01)
+            self._loss_lr_factor = max(self._loss_lr_factor, 0.05)
 
     def step(self):
         self._step += 1
         warmup_end = self.warmup
-        blend_steps = 50
-        if self._step < warmup_end + blend_steps:
-            if self._step < warmup_end:
-                mult = self._step / max(warmup_end, 1)
-                override = max(0.0, 1.0 - mult * 0.7)
-            else:
-                blend = (self._step - warmup_end) / blend_steps
-                mult = 1.0 - blend * 0.3
-                override = 0.3 * max(0.0, 1.0 - blend)
-            temp_max, temp_min = 2.0, 0.5
-            if self._step < warmup_end:
-                t = self._step / max(warmup_end, 1)
-                temp = temp_max - t * (temp_max - temp_min)
-            else:
-                blend = min(1.0, (self._step - warmup_end) / blend_steps)
-                temp = temp_min + (1.0 - blend) * (temp_max - temp_min) * 0.3
+        if self._step <= warmup_end:
+            mult = self._step / max(warmup_end, 1)
+            override = max(0.0, 1.0 - mult * 0.7)
+            temp = 2.0 - mult * 1.5
             for layer in self.model.layers:
                 layer.mirror._alpha_override.fill_(override)
                 layer.mirror._usefulness_temp.fill_(max(temp, 0.1))
         else:
             for layer in self.model.layers:
                 layer.mirror._alpha_override.fill_(0.0)
-            var, mag, mean_1malpha, gate_var = self._mirror_stats()
-
-            if self._init_var is None:
-                self._init_var = var + 1e-10
-                self._init_1malpha = mean_1malpha + 1e-10
-                self._init_gate_var = gate_var + 1e-10
-
-            if not hasattr(self, '_var_ema'):
-                self._var_ema = var
-                self._1malpha_ema = mean_1malpha
-                self._gate_var_ema = gate_var
-            ema = 0.99
-            self._var_ema = ema * self._var_ema + (1 - ema) * var
-            self._1malpha_ema = ema * self._1malpha_ema + (1 - ema) * mean_1malpha
-            self._gate_var_ema = ema * self._gate_var_ema + (1 - ema) * gate_var
-            var, mean_1malpha, gate_var = self._var_ema, self._1malpha_ema, self._gate_var_ema
-
-            var_growth = var / self._init_var
-            var_mult = min(2.0, max(0.5, 1.0 / max(var_growth, 1e-10)))
-
-            alpha_growth = mean_1malpha / self._init_1malpha
-            alpha_mult = min(2.0, max(0.5, 1.0 / max(alpha_growth, 1e-10)))
-
-            gate_growth = gate_var / self._init_gate_var
-            gate_mult = min(2.0, max(0.5, 1.0 / max(gate_growth, 1e-10)))
-
-            mag_factor = min(1.0, max(0.2, self.mag_threshold / max(mag, 1e-10)))
-
-            mirror_mult = (var_mult * alpha_mult * gate_mult) ** (1/3) * mag_factor
-            mult = max(0.05, min(1.0, mirror_mult))
             loss_factor = getattr(self, '_loss_lr_factor', 1.0)
-            mult *= loss_factor
-
-            if self._step - self._last_log >= 500:
-                self._last_log = self._step
-                print(f'  lr_adapt: var(ls)={var:.6f} |1-a|={mean_1malpha:.6f} '
-                      f'gate_var={gate_var:.6f} |mirror|={mag:.4f} '
-                      f'loss_f={loss_factor:.4f} '
-                      f'mult={mult:.4f} lr={self.base_lr*mult:.2e}')
+            mult = max(0.1, min(1.0, loss_factor))
 
         for i, pg in enumerate(self.optimizer.param_groups):
             pg['lr'] = self._orig_lrs[i] * mult
