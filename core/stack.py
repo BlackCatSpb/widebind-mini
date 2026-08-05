@@ -606,10 +606,10 @@ class WideBindStack(nn.Module):
                 elif any(g in name for g in ['.mirror.alpha_diag', '.mirror.w_pred_scale_legacy',
                                               '.log_skip_alpha', '.mirror.W_proj', '.mirror.W_out',
                                               '.mirror.w_temp', '.mirror.w_global',
-                                              '.mirror.tanh_bias',
+                                              '.mirror.tanh_bias', '.mirror.log_scale',
                                               '.log_dvar_mod_scale', '.dvar_mod_bias',
                                               '.log_grad_mod_scale', '.grad_mod_bias']):
-                    k = 'mirror_wd' if (p.ndim >= 2 and '.log_scale' not in name) else 'mirror'
+                    k = 'mirror' if '.log_scale' in name else ('mirror_wd' if p.ndim >= 2 else 'mirror')
                     groups[k]['params'].append(p)
                 elif '.mlp.' in name or '.bind.W_proj.weight' in name or name.endswith('.W_out') or name.endswith('.W_proj'):
                     k = 'mlp_wd' if p.ndim >= 2 else 'mlp'
@@ -757,7 +757,10 @@ class MirrorLRScheduler:
             mult = max(0.1, min(1.0, loss_factor))
 
         for i, pg in enumerate(self.optimizer.param_groups):
-            pg['lr'] = self._orig_lrs[i] * mult
+            if i < len(self._orig_lrs):
+                pg['lr'] = self._orig_lrs[i] * mult
+            else:
+                pg['lr'] = self.base_lr * mult
 
     def get_last_lr(self):
         return [pg['lr'] for pg in self.optimizer.param_groups]
