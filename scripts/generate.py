@@ -1,5 +1,5 @@
 """WideBind Mini text generation with meta-cognitive mind readout."""
-import os, sys, math, torch
+import os, sys, math, torch, inspect
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch.nn.functional as F
 from core import WideBandConfig, WideBindStack
@@ -14,12 +14,20 @@ def generate(model, prompt_tokens, max_new_tokens=128, temperature=1.0, top_k=50
     state = None
     recent = set()
     mind_log = []
+    head = model.lm_head
+    try:
+        h_emb_ok = 'h_emb' in inspect.signature(head.forward).parameters
+    except (TypeError, ValueError):
+        h_emb_ok = False
     for step in range(max_new_tokens):
         ctx = tokens[-L:].unsqueeze(0)
         h = model.embed_tokens(ctx)
         out, state, _ = model(h, state, adaptive=True,
                               context_mem=context_mem, allow_write=allow_write)
-        logits = model.lm_head(out[:, -1:, :])[0, 0]
+        if h_emb_ok:
+            logits = head(out[:, -1:, :], h[:, -1:, :])[0, 0]
+        else:
+            logits = head(out[:, -1:, :])[0, 0]
         logits = logits / temperature
         for rid in list(recent)[-5:]:
             logits[rid] -= 2.0
