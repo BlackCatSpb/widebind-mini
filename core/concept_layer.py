@@ -52,11 +52,11 @@ class CollectiveConceptLayer(nn.Module):
         self.register_buffer('M', F.normalize(m_init, dim=-1))
         self.register_buffer('U_s', torch.zeros(S))
         self.register_buffer('N_s', torch.zeros(S, dtype=torch.long))
-        self.register_buffer('_step', torch.zeros(1, dtype=torch.long), persistent=False)
-        self.register_buffer('_resvar_ref', torch.zeros(1), persistent=False)
-        self.register_buffer('_mature', torch.zeros(1), persistent=False)
-        self.register_buffer('_gate_u', torch.zeros(1), persistent=False)
-        self.register_buffer('_gate_c', torch.zeros(1), persistent=False)
+        self.register_buffer('_step', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('_resvar_ref', torch.zeros(1))
+        self.register_buffer('_mature', torch.zeros(1))
+        self.register_buffer('_gate_u', torch.zeros(1))
+        self.register_buffer('_gate_c', torch.zeros(1))
         self._maturity_frac = maturity_frac
         self._maturity_warmup = 0
 
@@ -130,7 +130,7 @@ class CollectiveConceptLayer(nn.Module):
 
         # refine nearest slot with confident tokens
         for s in range(self.S):
-            mask = (best == s) & (conf > 0.3)
+            mask = (best == s) & (conf > 0.1)
             if mask.any():
                 upd = F.normalize(shared[mask].mean(dim=0), dim=-1)
                 if self.N_s[s].item() < 10:
@@ -143,7 +143,7 @@ class CollectiveConceptLayer(nn.Module):
 
         # birth: empty slot + confident novel tokens
         empty = torch.nonzero(self.N_s == 0)
-        novel = (d_min > self._birth_gap * 0.5) & (conf > 0.3)
+        novel = (d_min > self._birth_gap * 0.3) & (conf > 0.1)
         if empty.numel() > 0 and novel.any():
             idx = empty[0].item()
             self.M.data[idx] = F.normalize(shared[novel].mean(dim=0), dim=-1)
