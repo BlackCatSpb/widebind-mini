@@ -507,9 +507,25 @@ class WideBindStack(nn.Module):
                     alpha_novelty_loss = alpha_novelty_loss - ad.mean(dim=-1).var()
             alpha_novelty_loss = alpha_novelty_loss / max(len(self.layers), 1)
 
+        pred_w_loss = 0.0
+        n_pred_w = 0
+        for layer in self.layers:
+            bind_w = None
+            if hasattr(layer, 'bind') and hasattr(layer.bind, 'W_proj'):
+                bind_w = layer.bind.W_proj.weight
+            head = getattr(self, 'lm_head', None)
+            if head is not None and hasattr(head, 'pred_w'):
+                pw = head.pred_w
+                if pw.ndim == 2:
+                    pred_w_loss = pred_w_loss + F.mse_loss(pw, torch.eye(pw.shape[0], device=pw.device))
+                    n_pred_w += 1
+        if n_pred_w > 0:
+            pred_w_loss = pred_w_loss / n_pred_w
+
         self._cached_losses = {
             'ce': ce_loss.item(),
             'pred': pred_loss.item() if isinstance(pred_loss, torch.Tensor) else pred_loss,
+            'pred_w': pred_w_loss.item() if isinstance(pred_w_loss, torch.Tensor) else pred_w_loss,
             'gate_l1': gate_l1.item() if isinstance(gate_l1, torch.Tensor) else gate_l1,
             'reinforce': reinforce_loss.item() if isinstance(reinforce_loss, torch.Tensor) else reinforce_loss,
             'balance': balance_loss.item() if isinstance(balance_loss, torch.Tensor) else balance_loss,
@@ -534,7 +550,10 @@ class WideBindStack(nn.Module):
         w_gate_rp = getattr(cfg, 'gate_repulse_weight', 0.0)
         w_alpha_nv = getattr(cfg, 'alpha_novelty_weight', 0.0)
         w_ls = getattr(cfg, 'log_scale_l2_weight', 0.0)
+        w_pred_w = getattr(cfg, 'pred_w_weight', 0.01)
         aux_dict = {}
+        if pred_w_loss != 0 and w_pred_w > 0:
+            aux_dict['pred_w'] = pred_w_loss * w_pred_w
         if pred_loss != 0:
             aux_dict['pred'] = pred_loss
         if gate_l1 != 0 and w_gate > 0:

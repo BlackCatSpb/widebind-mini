@@ -103,6 +103,7 @@ class WideBandConfig:
     diversity_weight: float = 0.001
     nuclear_weight: float = 1e-5
     orth_weight: float = 1e-4
+    pred_w_weight: float = 0.01
 
     vsa_b_d_max: float = 12.0
     vsa_b_d_smooth: float = 0.999
