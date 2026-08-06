@@ -43,6 +43,7 @@ class WideBandConfig:
     amp_sigma_min: float = 0.2    # нижняя граница σ (коробка [σ_min, 1] на forward)
     amp_gain_init: float = 0.5    # стартовый gain чтения (против насыщения tanh)
     amp_proto_init: float = 0.2   # разброс прототипов амплитуд α_vk
+    amp_proto_lr_mult: float = 5.0  # LR multiplier for proto (sparse updates need higher LR)
     amp_seed: int = 0             # детерминизм базиса/прототипов/кодов
 
     # CognitiveCodedHead: normalize token scores over the code space (the only

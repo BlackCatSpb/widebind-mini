@@ -85,6 +85,11 @@ def build_amp_groups(model, lr=2e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=
             role, rlr = 'embed', lr * embed_scale
         else:
             role, rlr = 'backbone', lr * backbone_scale
+
+        proto_mult = getattr(cfg, 'amp_proto_lr_mult', 1.0)
+        if name.endswith('proto'):
+            rlr = rlr * proto_mult
+
         out.append({'params': [p], 'lr': rlr, 'weight_decay': weight_decay,
                     'role': role, **meta})
     return out
