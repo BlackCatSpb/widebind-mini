@@ -77,6 +77,51 @@ def generate_report(ckpt_path):
     print(f'  tau ratio = {vsa_tau[-1].item() / vsa_tau[0].item():.1f}x')
 
     print()
+    print('PARAMETER GROUPS')
+    print('-' * 72)
+    groups = {
+        'Embedding': model.embed.parameters(),
+        'LM Head': model.lm_head.parameters(),
+        'Mirror': [],
+        'Bind': [],
+        'VSA': [],
+        'Conv': [],
+        'MLP': [],
+        'Collective': [],
+    }
+    for layer in model.layers:
+        groups['Mirror'].extend(layer.mirror.parameters())
+        if hasattr(layer.bind, 'parameters'):
+            groups['Bind'].extend(layer.bind.parameters())
+        groups['Conv'].extend(layer.conv.parameters())
+        groups['MLP'].extend(layer.mlp.parameters())
+        if layer.collective:
+            groups['Collective'].extend(layer.collective.parameters())
+        for n, p in layer.named_parameters():
+            if 'w_i' in n or 'w_d' in n or 'w_q' in n or 'b_i' in n or 'b_d' in n:
+                groups['VSA'].append(p)
+
+    total = 0
+    for name, params in groups.items():
+        n = sum(p.numel() for p in params)
+        total += n
+        if n > 0:
+            print(f'  {name:15s}: {n:>10,} ({n/1e6:.2f}M)')
+    print(f'  {"TOTAL":15s}: {total:>10,} ({total/1e6:.2f}M)')
+
+    print()
+    print('VRAM ESTIMATE')
+    print('-' * 72)
+    param_bytes = total * 4  # fp32
+    # Activations ~ params * 3-5x for transformer-like
+    act_mult = 3.0 + (2.0 if cfg.variable_precision else 0) + (1.0 if cfg.explicit_reasoning else 0)
+    vram_train = param_bytes * 3  # params + grads + optimizer states
+    vram_infer = param_bytes * 1.2  # params + activations
+    print(f'  Parameters:     {param_bytes/1e9:.2f} GB')
+    print(f'  Training est:   {vram_train/1e9:.2f} GB (with optimizer)')
+    print(f'  Inference est:  {vram_infer/1e9:.2f} GB')
+
+    print()
     print('TENSOR STATS')
     print('-' * 72)
     all_vals = torch.cat([p.data.flatten() for p in model.parameters()])
@@ -107,6 +152,12 @@ def generate_report(ckpt_path):
     else:
         stage = "Coherent text"
     print(f'  Stage: {stage}')
+
+    # Estimated progress
+    if val_loss < 20:
+        est_steps_to_9 = int((val_loss - 9) * 250)  # ~0.05 loss/250 steps
+        est_hours = est_steps_to_9 / 160 / 3600  # ~160 tok/s
+        print(f'  Est. to val<9:   ~{est_steps_to_9:,} steps (~{est_hours:.1f}h)')
 
     print()
     print('=' * 72)
