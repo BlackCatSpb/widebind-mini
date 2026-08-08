@@ -77,57 +77,96 @@ def generate_report(ckpt_path):
     print(f'  tau ratio = {vsa_tau[-1].item() / vsa_tau[0].item():.1f}x')
 
     print()
-    print('PARAMETER GROUPS')
+    print('PARAMETER GROUPS (exact)')
     print('-' * 72)
-    groups = {
-        'Embedding': list(model.embed.parameters()),
-        'LM Head': list(model.lm_head.parameters()),
-        'Mirror': [],
-        'Bind': [],
-        'VSA': [],
-        'Conv': [],
-        'MLP': [],
-        'Collective': [],
-        'Other': [],
-    }
-    # Collect layer-level params
+
+    groups = {}
+    captured_ids = set()
+
+    # 1. Embedding
+    groups['Embedding'] = list(model.embed.parameters())
+    captured_ids.update(id(p) for p in groups['Embedding'])
+
+    # 2. LM Head
+    groups['LM Head'] = list(model.lm_head.parameters())
+    captured_ids.update(id(p) for p in groups['LM Head'])
+
+    # 3. Per-layer groups
+    layer_group_names = ['Mirror', 'Bind', 'Conv', 'MLP', 'VSA', 'Spectral', 'Precision', 'Collective']
+    for name in layer_group_names:
+        groups[name] = []
+
     for layer in model.layers:
-        # Mirror params (inside layer.mirror)
-        groups['Mirror'].extend(layer.mirror.parameters())
-        # Bind params (inside layer.bind)
-        if hasattr(layer.bind, 'parameters'):
-            groups['Bind'].extend(layer.bind.parameters())
+        # Mirror
+        mirror_params = list(layer.mirror.parameters())
+        groups['Mirror'].extend(mirror_params)
+        captured_ids.update(id(p) for p in mirror_params)
+
+        # Bind
+        bind_params = list(layer.bind.parameters())
+        groups['Bind'].extend(bind_params)
+        captured_ids.update(id(p) for p in bind_params)
+
         # Conv
-        groups['Conv'].extend(layer.conv.parameters())
+        conv_params = list(layer.conv.parameters())
+        groups['Conv'].extend(conv_params)
+        captured_ids.update(id(p) for p in conv_params)
+
         # MLP
-        groups['MLP'].extend(layer.mlp.parameters())
-        # Collective
-        if layer.collective:
-            groups['Collective'].extend(layer.collective.parameters())
+        mlp_params = list(layer.mlp.parameters())
+        groups['MLP'].extend(mlp_params)
+        captured_ids.update(id(p) for p in mlp_params)
+
+        # VSA params in block
+        vsa_names = ['w_i', 'w_d', 'w_q', 'w_q_leaf', 'w_q_ctx', 'w_mem2v',
+                     'w_q_dyn', 'w_i_dyn', 'w_d_pen', 'w_bind_gate',
+                     'b_i', 'b_d', 'gamma_surprisal', 'scale_w',
+                     'w_k_mu', 'w_q_mu', 'w_mu_mem']
+        for p in layer.parameters():
+            if id(p) not in captured_ids:
+                # Check if it's a VSA param by name in the layer's named_params
+                for n, param in layer.named_parameters():
+                    if param is p and any(vn in n for vn in vsa_names):
+                        groups['VSA'].append(p)
+                        captured_ids.add(id(p))
+                        break
+
         # Spectral
         if hasattr(layer, 'lambda_k'):
-            groups['Other'].append(layer.lambda_k)
+            groups['Spectral'].append(layer.lambda_k)
+            captured_ids.add(id(layer.lambda_k))
+
         # Precision gate + exact memory
         if hasattr(layer, 'precision_gate'):
-            groups['Other'].extend(layer.precision_gate.parameters())
+            for p in layer.precision_gate.parameters():
+                groups['Precision'].append(p)
+                captured_ids.add(id(p))
         if hasattr(layer, 'exact_memory'):
-            groups['Other'].extend(layer.exact_memory.parameters())
+            for p in layer.exact_memory.parameters():
+                groups['Precision'].append(p)
+                captured_ids.add(id(p))
 
-    # VSA params (top-level + per-layer)
-    for p in model.parameters():
-        if any(x in str(p) for x in ['vsa', 'w_i', 'w_d', 'w_q', 'b_i', 'b_d', 'scale_w', 'gamma_surprisal', 'w_mem2v', 'w_k_mu', 'w_q_mu', 'w_mu_mem']):
-            if p not in [x for grp in groups.values() for x in grp]:
-                groups['VSA'].append(p)
+        # Collective
+        if layer.collective:
+            for p in layer.collective.parameters():
+                groups['Collective'].append(p)
+                captured_ids.add(id(p))
 
-    # Reclassify: put anything not yet captured into 'Other'
-    captured = set(id(p) for grp in groups.values() for p in grp)
-    for p in model.parameters():
-        if id(p) not in captured:
-            groups['Other'].append(p)
+    # 4. Top-level VSA timescales
+    groups['VSA'] += [p for p in [model._vsa_log_param, model._tau_l_dev]
+                      if p is not None]
+    captured_ids.update(id(p) for p in [model._vsa_log_param, model._tau_l_dev]
+                        if p is not None)
 
+    # 5. Anything not captured -> Other
+    groups['Other'] = [p for p in model.parameters() if id(p) not in captured_ids]
+
+    # Print
     total = 0
-    for name in ['Embedding', 'LM Head', 'Mirror', 'Bind', 'VSA', 'Conv', 'MLP', 'Collective', 'Other']:
-        params = groups[name]
+    display_order = ['Embedding', 'LM Head', 'MLP', 'Mirror', 'Bind',
+                     'VSA', 'Conv', 'Spectral', 'Precision', 'Collective', 'Other']
+    for name in display_order:
+        params = groups.get(name, [])
         n = sum(p.numel() for p in params)
         total += n
         if n > 0:
@@ -139,7 +178,11 @@ def generate_report(ckpt_path):
     print(f'  {"ACTUAL TOTAL":15s}: {actual_total:>10,} ({actual_total/1e6:.2f}M)')
     if total != actual_total:
         diff = actual_total - total
-        print(f'  {"MISSING":15s}: {diff:>10,} ({diff/1e6:.2f}M)')
+        print(f'  {"DIFFERENCE":15s}: {diff:>10,} ({diff/1e6:.2f}M)')
+        # Buffers (like pre_ln_w, final_norm_w) are in state_dict but not parameters()
+        buffers = {n for n, _ in model.named_buffers()}
+        if abs(diff) > 100:
+            print(f'  NOTE: {len(buffers)} buffers exist (e.g. pre_ln_w, final_norm_w)')
 
     print()
     print('VRAM ESTIMATE')
