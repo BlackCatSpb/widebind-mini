@@ -1,14 +1,29 @@
-# Token streams (large binary data)
-wb/
-
-# Checkpoints
-checkpoints/*.pt
-checkpoints/*.pth
-
-# Python cache
+# Build & Cache
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+
+# Checkpoints & Models
+checkpoints/
+checkpoints_codec/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Logs
+logs/
+*.log
+*.err
+
+# Tokenizer (large binary files)
+wb/russian_tokenizer/*.json
+
+# Archive
+archive/
+docs/archive/
+scripts/archive/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -21,11 +36,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Logs
-logs/
-
-# Active training run checkpoints
-checkpoints_codec/
-# Logs
-*.log
-*.err
+# Temp files
+*.txt
+!requirements.txt
