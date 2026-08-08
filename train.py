@@ -202,14 +202,6 @@ def train(cfg, data_dir, device):
 
             x, y = x.to(device), y.to(device)
 
-            # Read next 10 tokens for aux mirror (future context target)
-            aux_target = None
-            if cfg.aux_mirror_weight > 0:
-                need = cfg.batch_size * 10
-                if offset + need <= s.len:
-                    raw = s.data[offset:offset + need]
-                    aux_target = torch.from_numpy(raw.copy()).long().view(cfg.batch_size, 10).to(device)
-
             # Soft EOS reset: decay state instead of dropping it
             if (y[:, -1] == 2).any() and state is not None:
                 state = _soft_reset(state, factor=0.3)
@@ -220,16 +212,6 @@ def train(cfg, data_dir, device):
 
             # Compute losses (raw, unweighted)
             ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
-
-            # Aux mirror loss (predict macro-embedding of next 10 tokens from last state)
-            if aux_target is not None and model._cached_aux_pred is not None:
-                target_embed = model.embed_tokens(aux_target).mean(dim=1).detach()
-                with torch.no_grad():
-                    target_proj = model.aux_proj(target_embed)
-                aux_mirror_loss = (1.0 - F.cosine_similarity(
-                    model._cached_aux_pred, target_proj, dim=-1)).mean()
-                aux_dict['aux_mirror'] = aux_mirror_loss * cfg.aux_mirror_weight
-                model._cached_losses['aux_mirror'] = aux_mirror_loss.item()
 
             # NaN guard
             if torch.isnan(ce_loss) or torch.isinf(ce_loss):
@@ -428,6 +410,7 @@ if __name__ == '__main__':
     parser.add_argument('--save-dir', default='checkpoints', help='Checkpoint directory')
     parser.add_argument('--D', type=int, default=896, help='Model dimension')
     parser.add_argument('--n-layers', type=int, default=12, help='Number of layers')
+    parser.add_argument('--bind-K', type=int, default=32, help='Bind bottleneck dimension')
     parser.add_argument('--mlp-groups', type=int, default=8, help='MLP groups')
     parser.add_argument('--mlp-expand', type=int, default=4, help='MLP expansion factor')
     parser.add_argument('--seq-len', type=int, default=512, help='Sequence length')
@@ -437,11 +420,9 @@ if __name__ == '__main__':
     parser.add_argument('--eval-interval', type=int, default=500, help='Eval every N steps')
     parser.add_argument('--save-interval', type=int, default=2000, help='Save every N steps')
     parser.add_argument('--compile', action='store_true', help='Enable torch.compile (~30% tok/s)')
-    parser.add_argument('--div-weight', type=float, default=None, help='Expert diversity loss weight (pushes var(log_scale) up)')
+    parser.add_argument('--div-weight', type=float, default=None, help='Expert diversity loss weight')
     parser.add_argument('--private-mem', action='store_true', help='Enable cross-expert private memory bank')
-    parser.add_argument('--collective-layer', action='store_true', help='Enable collective concept layer (experimental)')
-    parser.add_argument('--collective-write-delay', type=int, default=None, help='Overrides collective write delay (for testing)')
-    parser.add_argument('--aux-mirror-weight', type=float, default=0.0, help='External mirror loss weight (0=off)')
+    parser.add_argument('--collective', action='store_true', help='Enable collective concept layer')
     parser.add_argument('--no-expert-asymmetry', action='store_true', help='Disable asymmetric expert init')
     parser.add_argument('--no-meta-trust', action='store_true', help='Disable meta-trust instability penalty')
     parser.add_argument('--no-lambda', action='store_true', help='Disable lambda_d hierarchy')
@@ -449,14 +430,21 @@ if __name__ == '__main__':
     parser.add_argument('--bind-twist-mode', default='trajectory_spiral',
                         choices=['off', 'shift', 'cascade', 'spiral', 'trajectory_spiral'],
                         help='Bind mode: off/shift/cascade/spiral/trajectory_spiral')
-    parser.add_argument('--head', default='partitioned',
-                        choices=['partitioned', 'sigmoid_coded', 'cognitive_coded', 'codec'],
-                        help='LM head mode (default: partitioned; codec = SignedAmpCodec CE)')
+    parser.add_argument('--head', default='sigmoid_coded',
+                        choices=['partitioned', 'sigmoid_coded', 'cognitive_coded'],
+                        help='LM head mode (default: sigmoid_coded)')
+    parser.add_argument('--variable-precision', action='store_true', help='Enable Variable Precision Memory')
+    parser.add_argument('--precision-threshold', type=float, default=0.3, help='Precision gate threshold')
+    parser.add_argument('--explicit-reasoning', action='store_true', help='Enable Explicit Reasoning (chain-of-thought)')
+    parser.add_argument('--reasoning-max-steps', type=int, default=8, help='Max reasoning steps')
+    parser.add_argument('--surprisal-weight', type=float, default=0.0, help='Surprisal loss weight (0=disabled)')
+    parser.add_argument('--branch-balance-weight', type=float, default=0.0, help='Branch balance loss weight')
     parser.add_argument('--device', default='cuda', help='Device (cuda/cpu)')
     args = parser.parse_args()
 
     cfg_kw = dict(
         D=args.D, n_layers=args.n_layers,
+        bind_K=args.bind_K,
         mlp_groups=args.mlp_groups, mlp_expand=args.mlp_expand,
         seq_len=args.seq_len, batch_size=args.batch_size,
         lr=args.lr, max_steps=args.max_steps,
@@ -464,22 +452,23 @@ if __name__ == '__main__':
         lambda_d_enabled=not args.no_lambda,
         bind_twist_mode=args.bind_twist_mode,
         head_mode=args.head,
-        amp_codec=(args.head == 'codec'),
         data_dir=args.data_dir, save_dir=args.save_dir,
         grad_clip=0.5, conv_kernel=48,
         accum_steps=args.accum, compile=args.compile,
-        private_mem=True,
-        collective_layer=True,
-        collective_write_delay=50,
+        private_mem=args.private_mem,
+        collective_layer=args.collective,
         collective_layer_idx=None,
-        aux_mirror_weight=args.aux_mirror_weight,
         expert_asymmetry=not args.no_expert_asymmetry,
         meta_trust=not args.no_meta_trust,
+        variable_precision=args.variable_precision,
+        precision_threshold=args.precision_threshold,
+        explicit_reasoning=args.explicit_reasoning,
+        reasoning_max_steps=args.reasoning_max_steps,
+        surprisal_weight=args.surprisal_weight,
+        branch_balance_weight=args.branch_balance_weight,
     )
     if args.div_weight is not None:
         cfg_kw['div_weight'] = args.div_weight
-    if args.collective_write_delay is not None:
-        cfg_kw['collective_write_delay'] = args.collective_write_delay
     cfg = WideBandConfig(**cfg_kw)
 
     device = args.device if torch.cuda.is_available() else 'cpu'
