@@ -12,6 +12,32 @@ from .mlp import GroupedMLP
 from .concept_layer import CollectiveConceptLayer
 
 
+class PrecisionGate(nn.Module):
+    def __init__(self, D):
+        super().__init__()
+        self.gate = nn.Linear(D, 1)
+
+    def forward(self, h):
+        return torch.sigmoid(self.gate(h))
+
+
+class ExactSequenceMemory(nn.Module):
+    def __init__(self, D, k):
+        super().__init__()
+        self.query = nn.Linear(D, k)
+        self.key = nn.Linear(D, k)
+        self.value = nn.Linear(D, k)
+        self.proj = nn.Linear(k, D)
+        self.k = k
+
+    def forward(self, h):
+        q = self.query(h)
+        k = self.key(h)
+        v = self.value(h)
+        attn = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(self.k), dim=-1)
+        return self.proj(attn @ v)
+
+
 class WideBindBlock(nn.Module):
     def __init__(self, cfg: WideBindConfig, layer_idx: int):
         super().__init__()
@@ -98,6 +124,13 @@ class WideBindBlock(nn.Module):
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups,
                               swiglu=getattr(cfg, 'mlp_swiglu', True))
 
+        # Variable Precision Memory
+        self.precision_gate = PrecisionGate(cfg.D)
+        exact_k = min(64, cfg.D // 4)
+        self.exact_memory = ExactSequenceMemory(cfg.D, exact_k)
+        self.variable_precision = getattr(cfg, 'variable_precision', False)
+        self.precision_threshold = getattr(cfg, 'precision_threshold', 0.3)
+
         self.collective = None
         col_idx = getattr(cfg, 'collective_layer_idx', None)
         if getattr(cfg, 'collective_layer', False) and (col_idx is None or layer_idx == col_idx):
@@ -159,6 +192,8 @@ class WideBindBlock(nn.Module):
 
         if isinstance(self.bind, TrajectorySpiralBind):
             traj_state = getattr(self, '_traj_state', None)
+            if traj_state is not None and traj_state[0].shape[1] != L:
+                traj_state = None
             bind_out, new_traj = self.bind(h, traj_state)
             # Soft EMA decay: τ_t = 0.9 * τ_{t-1} + 0.1 * new_traj
             if traj_state is None:
@@ -320,6 +355,13 @@ class WideBindBlock(nn.Module):
         self._cache_mirror_out = mirror
         h = h + enhanced
         if _chk(h, 'post_enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+
+        # Variable Precision Memory
+        if self.variable_precision:
+            precision = self.precision_gate(h)
+            if precision.mean() > self.precision_threshold:
+                exact = self.exact_memory(h)
+                h = h + precision * exact
 
         h_dct = h @ self.V_dct.T
         h = h + (h_dct * self.lambda_k * spectral_mod) @ self.V_dct

@@ -9,7 +9,7 @@ class WideBandConfig:
     D: int = 896
     n_layers: int = 12
     bind_K: int = 32
-    vocab: int = 50000
+    vocab: int = 65536
     seq_len: int = 512
     batch_size: int = 2
     lr: float = 3e-4
@@ -23,33 +23,11 @@ class WideBandConfig:
 
     tie_bind: bool = True
     tie_mirror_proj: bool = True
-    zeckendorf_readout: bool = False
 
-    # Head selector (overrides zeckendorf_readout when non-default)
-    #   "partitioned"   → PartitionedHead (linear V-logits + softmax-CE)
-    #   "sigmoid_coded" → SigmoidCodedHead (factored Bernoulli, no softmax, O(K) train)
-    #   "codec"         → SignedAmpCodec (порт из основного репо): SignedAmpEmbedding +
-    #                     SignedAmpHead с CE-целью, W_pred, эхо-каналом (подтверждённый рецепт)
-    head_mode: str = "partitioned"
-
+    head_mode: str = "sigmoid_coded"
+    head_normalize: bool = True
     code_dim: int = 32
     code_sparsity: int = 6
-
-    # ─── SignedAmpCodec (порт из основного репо, рецепт docs/AMPLITUDE_CODEC.md) ───
-    amp_codec: bool = False       # True → SignedAmpEmbedding + SignedAmpHead
-    amp_pred: bool = True         # механизм A: оператор перехода W_pred (K×K)
-    amp_obj: str = 'ce'           # 'ce' — одна CE-цель (подтверждён); 'mh' — margin+hinge
-    amp_scale: float = 1.0        # масштаб записи кода в residual stream
-    amp_sigma_min: float = 0.2    # нижняя граница σ (коробка [σ_min, 1] на forward)
-    amp_gain_init: float = 0.5    # стартовый gain чтения (против насыщения tanh)
-    amp_proto_init: float = 0.2   # разброс прототипов амплитуд α_vk
-    amp_proto_lr_mult: float = 5.0  # LR multiplier for proto (sparse updates need higher LR)
-    amp_seed: int = 0             # детерминизм базиса/прототипов/кодов
-
-    # CognitiveCodedHead: normalize token scores over the code space (the only
-    # honest fix for the C(K,S)>V calibration leak). False keeps the strict
-    # unnormalized factored Bernoulli (miscalibrated by construction).
-    head_normalize: bool = True
 
     mirror_k: int = 32
     mirror_k_staircase: bool = True
@@ -57,6 +35,29 @@ class WideBandConfig:
     log_scale_init_std: float = 0.05
     mlp_groups: int = 8
     mlp_expand: int = 4
+    private_mem: bool = True
+
+    expert_asymmetry: bool = True
+    meta_trust: bool = True
+
+    collective_layer: bool = True
+    collective_layer_idx: int = 6
+    collective_read_out: bool = True
+    collective_S: int = 8
+    collective_uncert_theta: float = 0.5
+    collective_uncert_kappa: float = 3.0
+    collective_contra_thresh: float = -0.1
+    collective_contra_gain: float = 6.0
+    collective_birth_gap: float = 0.55
+    collective_maturity_thresh: float = 0.12
+
+    log_scale_l2_weight: float = 0.01
+    div_weight: float = 50.0
+    ranking_weight: float = 0.01
+    gate_repulse_weight: float = 0.3
+    alpha_novelty_weight: float = 0.05
+    gate_bias_scale: float = 2.0
+    gate_bias_scale_per_layer: bool = True
 
     scheduler: str = 'mirror'
     target_var: float = 0.1
@@ -89,72 +90,45 @@ class WideBandConfig:
     bind_twist_mode: str = "trajectory_spiral"
     bind_twist_S: int = 4
     bind_traj_dims: int = 3
+    hybrid_alpha_max: float = 0.7
+    hybrid_alpha_min: float = 0.3
+    bind_twist_ocular: str = "tied"
+    bind_twist_scheme: str = "golden"
+    bind_twist_gate: bool = False
 
-    spec_lo: float = 0.5
-    spec_hi: float = 1.5
-    lambda_sliding: bool = True
+    bind_qk_norm: bool = True
+    rope_theta: float = 1000000.0
+    rope_scaling: float = 1.0
+    mlp_swiglu: bool = True
+
+    # Variable Precision Memory
+    variable_precision: bool = False
+    precision_threshold: float = 0.3
+
+    # Explicit Reasoning
+    explicit_reasoning: bool = False
+    reasoning_max_steps: int = 8
+
+    surprisal_weight: float = 0.0
+    branch_balance_weight: float = 0.0
+
+    accum_steps: int = 1
+    compile: bool = False
+
+    gate_l1_weight: float = 0.0001
+    reinforce_weight: float = 0.001
+    balance_weight: float = 0.026
+    diversity_weight: float = 0.001
+    nuclear_weight: float = 1e-5
+    orth_weight: float = 1e-4
 
     cov_multi_timescale: bool = True
     cov_tau_lo: int = 3
     cov_tau_hi: int = 200
 
-    gate_l1_weight: float = 0.0001
-    reinforce_weight: float = 0.001
-    balance_weight: float = 0.026  # λ⁻⁶ → HHI-based load balancing (adaptive from here)
-    diversity_weight: float = 0.001
-    nuclear_weight: float = 1e-5
-    orth_weight: float = 1e-4
-    pred_w_weight: float = 0.01
-
     vsa_b_d_max: float = 12.0
     vsa_b_d_smooth: float = 0.999
     vsa_b_lr_mult: float = 0.1
-
-    # BottleneckBind twist: inter-channel bilinear mixing via golden-angle shifts
-    bind_twist_mode: str = "shift"        # "off" | "shift" | "cascade"
-    bind_twist_S: int = 4                # number of shifts (overridden to 1 when mode=off)
-    bind_twist_ocular: str = "tied"      # "tied" | "multi" — per-shift W_out
-    bind_twist_scheme: str = "golden"    # "golden" | "fibonacci"
-    bind_twist_gate: bool = False        # per-token adaptive aperture via hp
-
-    # ─── Qwen3-inspired upgrades ───
-    bind_qk_norm: bool = True            # RMSNorm on hp before bottleneck cross (≈QK-Norm)
-    rope_theta: float = 1000000.0        # RoPE base frequency (Qwen3: 1e6)
-    rope_scaling: float = 1.0            # RoPE scaling factor (linear)
-    mlp_swiglu: bool = True              # SwiGLU gate_proj parallel to up_proj (Qwen3-style)
-
-    accum_steps: int = 1
-    compile: bool = False
-    div_weight: float = 50.0  # push log_scale variance via -var(sigmoid(ls)) (bounded, self-limiting)
-    ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (bypasses spectral alignment)
-    gate_repulse_weight: float = 0.3  # push gate variance up (inverse of balance, bypasses spectral)
-    alpha_novelty_weight: float = 0.05  # push per-expert alpha apart (heuristic, no spectral)
-    gate_bias_scale: float = 2.0  # linspace init for gate bias per expert [-scale, scale]
-    gate_bias_scale_per_layer: bool = True  # 0.5 (first layer) -> 2.0 (last)
-    private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
-
-    # ─── Spec 1: Asymmetric expert init ───
-    expert_asymmetry: bool = True  # break symmetry: different alpha, log_scale, W_proj per expert
-
-    # ─── Spec 2: External mirror (auxiliary world model) ───
-    aux_mirror_weight: float = 0.0  # 0=off, 0.1=aux cosine loss weight
-
-    # ─── Spec 3: Recursive meta-trust ───
-    meta_trust: bool = True  # track trust dynamics, penalize unstable experts (requires private_mem)
-
-    # ─── Spec 4: Collective Concept Layer (experimental) ───
-    collective_layer: bool = False
-    collective_layer_idx: int = 6      # Mini: L6 (Main: L11)
-    collective_S: int = 8              # shared slots
-    collective_write_delay: int = 5000 # like private_mem
-    collective_uncert_theta: float = 0.5
-    collective_uncert_kappa: float = 3.0
-    collective_contra_thresh: float = -0.1
-    collective_contra_gain: float = 6.0
-    collective_birth_gap: float = 0.55
-    collective_maturity_thresh: float = 0.12  # mirror resvar EMA below -> layer mature
-
-    log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
 
     max_steps: int = 300000
     log_interval: int = 100
@@ -199,5 +173,4 @@ class WideBandConfig:
         self.patience = lc.patience
 
 
-# Backward-compat alias for model.py
 WideBindConfig = WideBandConfig

@@ -331,6 +331,12 @@ class TrajectorySpiralBind(nn.Module):
         B, L, K = hp.shape
         self._step_count += 1
 
+        # Reset traj_state if sequence length changed
+        if traj_state is not None:
+            state_L = traj_state[0].shape[1]
+            if state_L != L:
+                traj_state = None
+
         # Build trajectory: current hp + external states
         if traj_state is None or len(traj_state) < self.n_dims - 1:
             n_have = 0 if traj_state is None else len(traj_state)

@@ -6,11 +6,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .config import WideBindConfig
 from .embedding import PartitionedEmbedding, PartitionedHead
-from .block import WideBindBlock
-from .zeckendorf_readout import ZeckendorfReadout
 from .sigmoid_head import SigmoidCodedHead
 from .cognitive_head import CognitiveCodedHead
-from .amp_codec import SignedAmpEmbedding, SignedAmpHead
+from .block import WideBindBlock
+from .reasoning import ReasoningMemory, ThinkingTokenHead
 
 
 class AdaptiveController:
@@ -130,28 +129,26 @@ class WideBindStack(nn.Module):
     def __init__(self, cfg: WideBindConfig):
         super().__init__()
         self.cfg = cfg
-        if getattr(cfg, 'amp_codec', False):
-            # Подтверждённый порт из основного репо: кодек («подписанная амплитуда»)
-            # с одной CE-целью, W_pred (механика A) и двухканальным чтением (эхо).
-            self.embed = SignedAmpEmbedding(cfg)
-            self.lm_head = SignedAmpHead(cfg,
-                                         embed_basis=self.embed.basis,
-                                         embed_proto=self.embed.proto)
+        self.embed = PartitionedEmbedding(cfg)
+        head_mode = getattr(cfg, 'head_mode', 'sigmoid_coded')
+        if head_mode == 'sigmoid_coded':
+            self.lm_head = SigmoidCodedHead(cfg, embed_basis=self.embed.basis)
+        elif head_mode == 'cognitive_coded':
+            self.lm_head = CognitiveCodedHead(cfg, embed_basis=self.embed.basis,
+                                              k_mirror=cfg.mirror_k)
+        elif head_mode == 'partitioned':
+            self.lm_head = PartitionedHead(cfg, embed_basis=self.embed.basis)
         else:
-            self.embed = PartitionedEmbedding(cfg)
-            head_mode = getattr(cfg, 'head_mode', 'partitioned')
-            if getattr(cfg, 'zeckendorf_readout', False):
-                self.lm_head = ZeckendorfReadout(cfg)
-            elif head_mode == 'sigmoid_coded':
-                self.lm_head = SigmoidCodedHead(cfg, embed_basis=self.embed.basis)
-            elif head_mode == 'cognitive_coded':
-                self.lm_head = CognitiveCodedHead(cfg, embed_basis=self.embed.basis)
-            else:
-                self.lm_head = PartitionedHead(cfg, embed_basis=self.embed.basis)
+            raise ValueError(f'Unknown head_mode: {head_mode}')
 
         self.layers = nn.ModuleList([
             WideBindBlock(cfg, i) for i in range(cfg.n_layers)
         ])
+
+        self.explicit_reasoning = getattr(cfg, 'explicit_reasoning', False)
+        if self.explicit_reasoning:
+            self.reasoning_memory = ReasoningMemory(cfg.D, max_steps=getattr(cfg, 'reasoning_max_steps', 8))
+            self.thinking_head = ThinkingTokenHead(cfg.D)
 
         self.register_buffer('final_norm_w', torch.ones(cfg.D))
         self.aux_proj = nn.Linear(cfg.D, max(1, cfg.D // 8))
@@ -283,7 +280,20 @@ class WideBindStack(nn.Module):
                     self._pred_cache.append((mir._cached_pred_k, mir._cached_hp))
 
         self._cached_aux_pred = self.aux_proj(h[:, -1, :]) if self.training else None
-        return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state, global_state
+
+        h = F.rms_norm(h, (self.cfg.D,), self.final_norm_w)
+
+        # Explicit Reasoning
+        if self.explicit_reasoning and hasattr(self, '_reasoning_buffer'):
+            reasoning_out, self._reasoning_buffer = self.reasoning_memory(
+                h, self._reasoning_buffer)
+            h = h + reasoning_out.unsqueeze(1)
+
+        return h, new_state, global_state
+
+    def reset_reasoning(self):
+        """Reset reasoning buffer (call at start of new sequence)."""
+        self._reasoning_buffer = None
 
     def embed_tokens(self, tokens):
         return self.embed(tokens)
@@ -299,22 +309,7 @@ class WideBindStack(nn.Module):
         return ce_m.sum() / mask.sum().clamp(min=1)
 
     def compute_losses(self, h, targets, pred_weight=None, h_emb=None):
-        if isinstance(self.lm_head, ZeckendorfReadout):
-            B, L, D = h.shape
-            log_probs = self.lm_head.log_probs_for_target(
-                h.reshape(-1, D), targets.reshape(-1))
-            ce = -log_probs.reshape(-1)
-            ce_loss = self._finalize_ce(ce, targets)
-        elif getattr(self.cfg, 'amp_codec', False) and hasattr(self.lm_head, 'ce_loss'):
-            # SignedAmpCodec: одна CE-цель по факторизованному счёту (без softmax-головы,
-            # но с LSE-нормализацией по V). h_emb — эхо-канал (своя запись, +3pt рецепта).
-            B, L, D = h.shape
-            hf = h.reshape(-1, D)
-            he = None if h_emb is None else h_emb.reshape(-1, D)
-            t = targets.reshape(-1)
-            ce = self.lm_head.ce_loss(hf, t, he)
-            ce_loss = self._finalize_ce(ce, targets)
-        elif hasattr(self.lm_head, 'log_probs_for_target'):
+        if hasattr(self.lm_head, 'log_probs_for_target'):
             # SigmoidCodedHead: точный per-target log P за O(K), без
             # материализации/softmax-нормализации по V.
             logp = self.lm_head.log_probs_for_target(h, targets)  # (B, L)
