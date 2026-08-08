@@ -80,34 +80,66 @@ def generate_report(ckpt_path):
     print('PARAMETER GROUPS')
     print('-' * 72)
     groups = {
-        'Embedding': model.embed.parameters(),
-        'LM Head': model.lm_head.parameters(),
+        'Embedding': list(model.embed.parameters()),
+        'LM Head': list(model.lm_head.parameters()),
         'Mirror': [],
         'Bind': [],
         'VSA': [],
         'Conv': [],
         'MLP': [],
         'Collective': [],
+        'Other': [],
     }
+    # Collect layer-level params
     for layer in model.layers:
+        # Mirror params (inside layer.mirror)
         groups['Mirror'].extend(layer.mirror.parameters())
+        # Bind params (inside layer.bind)
         if hasattr(layer.bind, 'parameters'):
             groups['Bind'].extend(layer.bind.parameters())
+        # Conv
         groups['Conv'].extend(layer.conv.parameters())
+        # MLP
         groups['MLP'].extend(layer.mlp.parameters())
+        # Collective
         if layer.collective:
             groups['Collective'].extend(layer.collective.parameters())
-        for n, p in layer.named_parameters():
-            if 'w_i' in n or 'w_d' in n or 'w_q' in n or 'b_i' in n or 'b_d' in n:
+        # Spectral
+        if hasattr(layer, 'lambda_k'):
+            groups['Other'].append(layer.lambda_k)
+        # Precision gate + exact memory
+        if hasattr(layer, 'precision_gate'):
+            groups['Other'].extend(layer.precision_gate.parameters())
+        if hasattr(layer, 'exact_memory'):
+            groups['Other'].extend(layer.exact_memory.parameters())
+
+    # VSA params (top-level + per-layer)
+    for p in model.parameters():
+        if any(x in str(p) for x in ['vsa', 'w_i', 'w_d', 'w_q', 'b_i', 'b_d', 'scale_w', 'gamma_surprisal', 'w_mem2v', 'w_k_mu', 'w_q_mu', 'w_mu_mem']):
+            if p not in [x for grp in groups.values() for x in grp]:
                 groups['VSA'].append(p)
 
+    # Reclassify: put anything not yet captured into 'Other'
+    captured = set(id(p) for grp in groups.values() for p in grp)
+    for p in model.parameters():
+        if id(p) not in captured:
+            groups['Other'].append(p)
+
     total = 0
-    for name, params in groups.items():
+    for name in ['Embedding', 'LM Head', 'Mirror', 'Bind', 'VSA', 'Conv', 'MLP', 'Collective', 'Other']:
+        params = groups[name]
         n = sum(p.numel() for p in params)
         total += n
         if n > 0:
             print(f'  {name:15s}: {n:>10,} ({n/1e6:.2f}M)')
-    print(f'  {"TOTAL":15s}: {total:>10,} ({total/1e6:.2f}M)')
+
+    actual_total = sum(p.numel() for p in model.parameters())
+    print(f'  {"":-<32s}')
+    print(f'  {"GROUPS SUM":15s}: {total:>10,} ({total/1e6:.2f}M)')
+    print(f'  {"ACTUAL TOTAL":15s}: {actual_total:>10,} ({actual_total/1e6:.2f}M)')
+    if total != actual_total:
+        diff = actual_total - total
+        print(f'  {"MISSING":15s}: {diff:>10,} ({diff/1e6:.2f}M)')
 
     print()
     print('VRAM ESTIMATE')
