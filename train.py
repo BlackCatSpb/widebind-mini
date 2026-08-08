@@ -13,6 +13,7 @@ Usage:
 
 import os, sys, math, time, glob, argparse, gc, logging
 import torch
+from torch.amp import autocast, GradScaler
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -115,14 +116,16 @@ def train(cfg, data_dir, device):
     # Data
     streams, total_tokens = load_streams(data_dir)
 
-    # Optimizer (AmpAdam для codec-головы, AdamW для partitioned)
-    if getattr(cfg, 'amp_codec', False):
-        groups = build_amp_groups(model, lr=cfg.lr, head_scale=1.0, embed_scale=0.5)
-        optimizer = AmpAdam(groups)
-    else:
-        groups = model.param_groups()
-        optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95))
+    # Optimizer
+    groups = model.param_groups()
+    optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95))
     scheduler = MirrorLRScheduler(model, optimizer, cfg=cfg)
+
+    # AMP (Automatic Mixed Precision)
+    use_amp = getattr(cfg, 'use_amp', False) and device == 'cuda'
+    scaler = GradScaler(enabled=use_amp)
+    if use_amp:
+        print('  AMP: ON (mixed precision)')
 
     # Resume
     start_step = 0
@@ -206,12 +209,11 @@ def train(cfg, data_dir, device):
             if (y[:, -1] == 2).any() and state is not None:
                 state = _soft_reset(state, factor=0.3)
 
-            # Forward (pure FP32, no autocast)
-            h = model.embed_tokens(x)
-            out, state, gs = model(h, state, global_state=gs, step=step)
-
-            # Compute losses (raw, unweighted)
-            ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
+            # Forward with optional AMP
+            with autocast('cuda', enabled=use_amp):
+                h = model.embed_tokens(x)
+                out, state, gs = model(h, state, global_state=gs, step=step)
+                ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
 
             # NaN guard
             if torch.isnan(ce_loss) or torch.isinf(ce_loss):
@@ -220,8 +222,11 @@ def train(cfg, data_dir, device):
             state = detach(state)
             gs = detach(gs)
 
-            # CE gradients (retain graph for aux backward)
-            ce_grads = torch.autograd.grad(ce_loss / accum, model.parameters(),
+            # CE gradients (scaled by AMP scaler if enabled)
+            ce_loss_scaled = ce_loss / accum
+            if use_amp:
+                ce_loss_scaled = scaler.scale(ce_loss_scaled)
+            ce_grads = torch.autograd.grad(ce_loss_scaled, model.parameters(),
                                            retain_graph=bool(aux_dict), allow_unused=True)
 
             # Separate bypass losses from spectral alignment
@@ -240,6 +245,8 @@ def train(cfg, data_dir, device):
             bypass_list = [v for v in bypass_losses.values() if v is not None]
             if bypass_list:
                 bypass_total = sum(bypass_list) / accum
+                if use_amp:
+                    bypass_total = scaler.scale(bypass_total)
                 bypass_retain = bool(aligned_dict)  # keep graph for aux_total if needed
                 bypass_grads = torch.autograd.grad(
                     bypass_total, model.parameters(), retain_graph=bypass_retain, allow_unused=True)
@@ -249,6 +256,8 @@ def train(cfg, data_dir, device):
             # Spectral gradient alignment for non-div aux losses
             if aligned_dict:
                 aux_total = sum(aligned_dict.values()) / accum
+                if use_amp:
+                    aux_total = scaler.scale(aux_total)
                 aux_grads = torch.autograd.grad(aux_total, model.parameters(), allow_unused=True)
                 ce_list, aux_list = [], []
                 for gce, gaux in zip(ce_grads, aux_grads):
@@ -317,8 +326,14 @@ def train(cfg, data_dir, device):
             tokens += cfg.batch_size * cfg.seq_len
 
             if (step + 1) % accum == 0:
+                if use_amp:
+                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                optimizer.step()
+                if use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
 
@@ -440,6 +455,7 @@ if __name__ == '__main__':
     parser.add_argument('--surprisal-weight', type=float, default=0.0, help='Surprisal loss weight (0=disabled)')
     parser.add_argument('--branch-balance-weight', type=float, default=0.0, help='Branch balance loss weight')
     parser.add_argument('--device', default='cuda', help='Device (cuda/cpu)')
+    parser.add_argument('--amp', action='store_true', help='Enable Automatic Mixed Precision (requires CUDA)')
     args = parser.parse_args()
 
     cfg_kw = dict(
@@ -466,6 +482,7 @@ if __name__ == '__main__':
         reasoning_max_steps=args.reasoning_max_steps,
         surprisal_weight=args.surprisal_weight,
         branch_balance_weight=args.branch_balance_weight,
+        use_amp=args.amp,
     )
     if args.div_weight is not None:
         cfg_kw['div_weight'] = args.div_weight

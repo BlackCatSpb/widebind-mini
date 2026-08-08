@@ -109,6 +109,9 @@ class WideBandConfig:
     explicit_reasoning: bool = False
     reasoning_max_steps: int = 8
 
+    # AMP (Automatic Mixed Precision)
+    use_amp: bool = False
+
     surprisal_weight: float = 0.0
     branch_balance_weight: float = 0.0
 
